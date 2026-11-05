@@ -1,0 +1,83 @@
+# 实际验证记录
+
+日期：2026-11-05（Asia/Shanghai）。执行环境：macOS、Python 3.13.7、本项目 `.venv`。
+
+## 已完成
+
+- 创建虚拟环境，安装实际依赖并执行 `python -m pip install -e '.[dev]'`，安装成功。
+- `python -m pip check`：`No broken requirements found.`
+- 最终执行 `python -m pytest -q`：**73 passed in 8.32s**，退出码 0。
+- `market-monitor demo`：实际运行成功，退出码 0。上涨、下跌、未收盘快速上涨、快速反转各产生一次通知，普通横盘无通知；每个场景再次检查均为 `repeat_alert=None`。演示明确标注合成数据且不调用 Telegram。
+- `market-monitor --help`：运行成功。
+- `python -m compileall -q src`：通过。
+
+实际安装的主要依赖：httpx 0.28.1、NumPy 2.5.4、Pandas 3.1.1、TA-Lib 0.8.3、Pytest 9.2.0。Python 3.11 声明受支持，但本次没有单独的 3.11 解释器进行跨版本执行。
+
+## 测试覆盖及观察
+
+| 检查 | 结果 |
+| --- | --- |
+| 连续上涨／连续下跌 | 对称产生持续单边信号，使用已完成 K 线 |
+| 小回撤 | 在配置的 ATR 容忍范围内仍可确认连续推进 |
+| 高 ER 但幅度很小／普通横盘／来回震荡 | 不触发 |
+| 当前未收盘 K 线快速上涨／下跌 | 收盘前产生快速信号 |
+| 极端涨跌 | 正确识别，指标及价格有限数检查通过 |
+| 快速反转 | 当前显著反向位移优先；30 分钟仍为正也可提醒下跌 |
+| ATR、ADX、DI | 与直接 TA-Lib 调用核对；ATR 使用事件之前基准，已知稳定波动范围也作独立检查 |
+| 15／30／45／60 分钟涨跌幅 | 使用分钟历史基准，误差 < 60 秒 |
+| NaN、非法 OHLC、缺口、重复、陈旧、未来时间、预热不足 | 拒绝无效数据；重复 API 行按开盘时间保留最后版本 |
+| 增量获取 | 正常使用 startTime 与约 3 根请求；缺口后丢弃缓存 |
+| 429／418 | 整个客户端暂停，不继续对其他标的发请求 |
+| 超时、5xx、非 JSON | 有限重试或明确失败，不产生假信号 |
+| 完整扫描管线的过期／缺失／异常 | 不通知、不更新持久化状态 |
+| 同一轮 60 次扫描／快速升级持续 | 只预约一次通知 |
+| 关闭并重新打开数据库 | 同一轮不重复通知 |
+| 两个连接共享同一数据库 | 同一轮只预约一次 |
+| 冷却／每日上限 | 抑制并记录原因，不延迟补发旧信号 |
+| 上海时区跨日 | 每日计数正确分日 |
+| 重置 | 需要连续不同完成 K 线；重复扫描和行情断档不累计重置次数 |
+| Telegram 模拟 200／失败／429／500 | 成功状态准确；失败不重发、不泄漏 Token |
+| 发送前预约 | 通知调用前 SQLite 已保存；模拟发送失败后再扫描不重复发送 |
+
+额外进行了**逐分钟向前回放**：25 小时平稳预热 → 90 分钟上涨 → 100 分钟横盘 → 60 分钟下跌。每一步仅用当时已有的分钟前缀聚合完成及形成中的 15m K 线。整个过程只产生一次上涨和一次下跌通知，两段运动均在开始后 30 分钟内识别。这是合成行情功能验证，不是交易回测或真实覆盖率统计。
+
+## 真实 Binance API：已修复并验证成功
+
+开发开始即尝试真实网络请求，而非假定某个合约存在：
+
+1. 受限环境 `GET https://fapi.binance.com/fapi/v1/time`：DNS 解析失败，curl 退出码 6。
+2. 放开网络权限后重试 time：TLS 连接失败，curl 退出码 35。
+3. 放开网络权限请求 `GET /fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=100`：SSL connection timeout，curl 退出码 28，HTTP 000。
+4. 放开网络权限独立请求 `GET /fapi/v1/exchangeInfo`：SSL connection timeout，curl 退出码 28，HTTP 000。
+5. 项目安装后实际执行 `market-monitor verify --config config.toml`：报 `startup/verification failed: market request failed: ConnectTimeout`，退出码 1。
+
+### 根因与修复后的实测
+
+继续排查确认：本机系统 DNS 将 `fapi.binance.com` 解析为 `199.59.149.207`（另有异常 IPv6 地址），而 Google DNS over HTTPS 返回 Binance 的 AWS 负载均衡域名及另一组 A 记录。通过当次查询地址建立连接、保留 Binance 域名和 HTTPS 证书校验后，`/fapi/v1/time` 立即返回 HTTP 200。系统代理当时关闭，配置中的 Clash 代理端口未监听。
+
+项目新增可选 `dns_over_https` 配置，示例配置已开启。解析记录按 TTL 缓存，最多缓存 300 秒，连接失败时尝试其他返回地址；保持 HTTP Host 和 TLS SNI 为 Binance 原域名。没有修改系统 DNS／hosts，没有写死 IP，没有关闭证书校验。DoH 模式为 Binance 直接连接；需要环境代理时关闭此选项。
+
+首次 DNS／TLS 预热可能超过原时间采样限制，因此增加一次暖连接重采样，仍保持不超过 5 秒的时间精度限制。在分钟切换边界遇到一次新 K 线尚未返回，原始时间戳确认正常；未放宽新鲜度要求，重新验证后通过。
+
+修复后实际执行 `market-monitor verify --config config.toml`：**退出码 0，20/20 标的 VERIFIED**。全部配置标的通过 exchangeInfo 的 TRADING 检查，每个标的成功获取 200 根 15m K 线和 65 根 1m K 线，TA-Lib 指标初始化与最近成交时间检查通过。共保存 **40 份真实 CSV** 到 `data/verification/`，共 5,300 根记录（包含形成中的 K 线）。没有使用现货、测试网或合成数据替代。
+
+新增测试覆盖 DoH 的 Host／SNI／查询参数保留、TTL 过期重查、地址失败切换、非法 DNS 记录拒绝、解析失败不使用过期记录、慢连接时间重采样及精度保护。最终 **73 项测试全部通过**。
+
+重现命令：
+
+```bash
+source .venv/bin/activate
+market-monitor verify --config config.toml
+market-monitor once --config config.toml
+market-monitor run --config config.toml
+```
+
+## Telegram：仅模拟验证
+
+没有提供 Bot Token 和 Chat ID，默认配置关闭 Telegram，本次没有发送真实 Telegram 消息。HTTP 请求体、响应处理、发送前持久化和错误脱敏已用 MockTransport／管线测试验证。
+
+本系统采用至多一次发送尝试，无法同时保证网络异常时绝不重复与绝不漏达。预约后崩溃或 Telegram 超时可能漏达通知；失败／不确定状态保存在 SQLite，默认不自动重发。真实投递可靠性仍需在配置凭证和真实网络后检查。
+
+## 验收边界
+
+源码、安装、CLI、检测、状态、控制台、Telegram 接入及自动化测试已交付。真实行情接入已验证；长期真实市场上的识别覆盖率、报警延迟、通知密度和真实 Telegram 投递尚未验证；默认阈值为初始经验参数，没有做收益优化或声称经过市场最优性验证。

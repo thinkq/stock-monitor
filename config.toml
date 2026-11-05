@@ -1,0 +1,37 @@
+# 所有阈值均为初始经验参数，未经最优性验证；启动时检查全部标的。
+symbols = ["BTCUSDT", "SOXLUSDT", "NVDAUSDT", "AVGOUSDT", "INTCUSDT", "AMDUSDT", "MUUSDT", "SNDKUSDT", "MRVLUSDT", "CRDOUSDT", "DELLUSDT", "MSFTUSDT", "APPUSDT"]
+interval = "15m"
+scan_seconds = 60
+history_bars = 200
+max_data_age_seconds = 180
+base_url = "https://fapi.binance.com"
+# 本机系统 DNS 解析异常；使用 DoH 动态解析，仍校验 Binance TLS 证书。
+# 如需 HTTPS_PROXY，设为 false；DoH 模式对 Binance 使用直接连接。
+dns_over_https = true
+database = "data/monitor.sqlite3"
+timezone = "Asia/Shanghai"
+directions = ["up", "down"]
+cooldown_seconds = 3600
+daily_limit = 30
+reset_bars = 2
+
+[detection]
+# 越小越灵敏：同时缩放百分比与 ATR 阈值，建议先用 1.0。
+sensitivity = 1.0
+atr_period = 14
+adx_period = 14
+fast_15_pct = 1.5
+fast_30_pct = 2.0
+fast_atr = 1.5
+sustained_pct = 2.0
+sustained_atr = 2.0
+er_min = 0.7
+pullback_atr = 0.35
+quiet_pct = 0.5
+quiet_er = 0.35
+
+[telegram]
+enabled = false
+# 凭证只从环境变量读取，不写入源码或 SQLite。
+token_env = "TELEGRAM_BOT_TOKEN"
+chat_id_env = "TELEGRAM_CHAT_ID"
