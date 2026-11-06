@@ -141,3 +141,23 @@ def test_clock_rejects_two_slow_samples(monkeypatch):
     with pytest.raises(MarketError, match='too slow'):
         api.sync_clock()
     assert api.clock is None
+
+
+def test_failed_scan_breaks_fast_confirmation_even_inside_time_window():
+    b, m, now = scenario((100, 100, 100), 102.5)
+    cfg = Config(symbols=['TESTUSDT'], history_bars=len(b))
+    api = Mock()
+    api.now_ms.return_value = now
+    api.get.return_value = {'symbol': 'TESTUSDT', 'time': now}
+    state = State(':memory:')
+    notifier = Mock()
+    monitor = Monitor(cfg, api, state, notifier)
+    monitor.cache.refresh = Mock(side_effect=[b, m])
+    assert monitor.scan() == 1
+    assert state.db.execute('select count(*) from pending_signals').fetchone()[0] == 1
+    monitor.cache.refresh = Mock(side_effect=MarketError('network failure'))
+    assert monitor.scan() == 0
+    assert state.db.execute('select count(*) from pending_signals').fetchone()[0] == 0
+    assert state.db.execute('select count(*) from alerts').fetchone()[0] == 0
+    notifier.send.assert_not_called()
+    state.close()

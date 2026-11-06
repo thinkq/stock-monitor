@@ -14,6 +14,8 @@ directions = ["up", "down"]
 cooldown_seconds = 3600
 daily_limit = 30
 reset_bars = 2
+# 快速信号须在相邻有效扫描中持续满足至少 60 秒；0 可关闭确认。
+fast_confirmation_seconds = 60
 
 [detection]
 # 越小越灵敏：同时缩放百分比与 ATR 阈值，建议先用 1.0。
@@ -22,7 +24,8 @@ atr_period = 14
 adx_period = 14
 fast_15_pct = 1.5
 fast_30_pct = 2.0
-fast_atr = 1.5
+fast_atr = 2.0
+fast_er_min = 0.65
 sustained_pct = 2.0
 sustained_atr = 2.0
 er_min = 0.7

@@ -41,7 +41,11 @@ class Monitor:
 
     def scan(self):
         # Any clock failure aborts the whole scan without touching episode state.
-        self.api.sync_clock()
+        try:
+            self.api.sync_clock()
+        except (MarketError, KeyError, TypeError, ValueError):
+            self.state.clear_pending()
+            raise
         good = 0
         for symbol in self.config.symbols:
             try:
@@ -49,8 +53,10 @@ class Monitor:
                 good += 1
                 LOG.info("%s fresh; signal=%s", symbol, obs.signal.kind if obs.signal else "none")
             except RateLimited:
+                self.state.clear_pending()
                 raise  # one global backoff, not 20 independent retry storms
             except (MarketError, KeyError, TypeError, ValueError) as exc:
+                self.state.clear_pending(symbol)
                 LOG.warning("%s skipped: %s", symbol, exc)
         return good
 

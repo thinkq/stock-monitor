@@ -16,7 +16,8 @@ class Detection:
     adx_period: int = 14
     fast_15_pct: float = 1.5
     fast_30_pct: float = 2.0
-    fast_atr: float = 1.5
+    fast_atr: float = 2.0
+    fast_er_min: float = 0.65
     sustained_pct: float = 2.0
     sustained_atr: float = 2.0
     er_min: float = 0.7
@@ -47,6 +48,7 @@ class Config:
     cooldown_seconds: int = 3600
     daily_limit: int = 30
     reset_bars: int = 2
+    fast_confirmation_seconds: int = 60
     detection: Detection = field(default_factory=Detection)
     telegram: Telegram = field(default_factory=Telegram)
 
@@ -66,13 +68,15 @@ class Config:
                 raise ValueError(f"{name} must be a positive integer")
         if self.cooldown_seconds < 0:
             raise ValueError("cooldown_seconds must be nonnegative")
+        if type(self.fast_confirmation_seconds) is not int or self.fast_confirmation_seconds < 0:
+            raise ValueError("fast_confirmation_seconds must be a nonnegative integer")
         d = self.detection
         for name, value in vars(d).items():
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"invalid detection parameter: {name}")
         if any(type(p) is not int or p < 2 for p in (d.atr_period, d.adx_period)):
             raise ValueError("indicator periods must be integers >= 2")
-        if d.er_min > 1 or d.quiet_er > 1:
+        if d.er_min > 1 or d.quiet_er > 1 or d.fast_er_min > 1:
             raise ValueError("ER thresholds must be <= 1")
         if not max(70, 3 * d.adx_period, d.atr_period + 10) <= self.history_bars <= 1000:
             raise ValueError("history_bars insufficient or > 1000")

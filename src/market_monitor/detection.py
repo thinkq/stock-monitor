@@ -114,7 +114,10 @@ def detect(symbol, candles, minutes, now_ms, config: Config) -> Observation:
                 and abs(price - base) / atr >= d.fast_atr * d.sensitivity):
             start = now_ms - window * 60_000 if window else int(current.time)
             path = minutes.loc[minutes.time >= start, "close"].to_numpy(dtype=float)
-            fast = make(direction, "fast", "forming", efficiency(np.r_[base, path]),
+            er = efficiency(np.r_[base, path])
+            if er < d.fast_er_min:
+                continue
+            fast = make(direction, "fast", "forming", er,
                         abs(price - base) / atr, int(current.time))
             break
     # A fast opposite move supersedes a now-obsolete completed-candle direction.

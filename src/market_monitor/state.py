@@ -25,10 +25,35 @@ class State:
             CREATE TABLE IF NOT EXISTS alerts (
                 id INTEGER PRIMARY KEY, symbol TEXT, direction TEXT, kind TEXT,
                 detected_ms INTEGER, day TEXT, payload TEXT, status TEXT, detail TEXT);
+            CREATE TABLE IF NOT EXISTS pending_signals (
+                symbol TEXT PRIMARY KEY, direction TEXT, first_seen INTEGER, last_seen INTEGER);
         """)
 
     def close(self):
         self.db.close()
+
+    def clear_pending(self, symbol=None):
+        """A failed observation interrupts confirmation, not an already alerted episode."""
+        if symbol is None:
+            self.db.execute("DELETE FROM pending_signals")
+        else:
+            self.db.execute("DELETE FROM pending_signals WHERE symbol=?", (symbol,))
+
+    def _confirm_fast(self, symbol, direction, now_ms, config):
+        """Confirmation survives restarts, but expires across missing scans."""
+        row = self.db.execute("SELECT * FROM pending_signals WHERE symbol=?", (symbol,)).fetchone()
+        if config.fast_confirmation_seconds == 0:
+            self.db.execute("DELETE FROM pending_signals WHERE symbol=?", (symbol,))
+            return True
+        if row is None or row["direction"] != direction or not 0 <= now_ms - row["last_seen"] <= config.scan_seconds * 1500:
+            self.db.execute("INSERT OR REPLACE INTO pending_signals VALUES (?,?,?,?)",
+                            (symbol, direction, now_ms, now_ms))
+            return False
+        if now_ms - row["first_seen"] >= config.fast_confirmation_seconds * 1000:
+            self.db.execute("DELETE FROM pending_signals WHERE symbol=?", (symbol,))
+            return True
+        self.db.execute("UPDATE pending_signals SET last_seen=? WHERE symbol=?", (now_ms, symbol))
+        return False
 
     def observe(self, symbol: str, obs: Observation, now_ms: int, config: Config):
         """Only call with fresh, fully validated data. Returns reserved alert id or None."""
@@ -47,12 +72,18 @@ class State:
                     self.db.execute("UPDATE episodes SET quiet_count=0 WHERE symbol=? AND direction=?", (symbol, direction))
             signal = obs.signal
             alert_id = None
+            if signal is None or signal.kind != "fast":
+                self.db.execute("DELETE FROM pending_signals WHERE symbol=?", (symbol,))
             if signal:
                 row = self.db.execute("SELECT * FROM episodes WHERE symbol=? AND direction=?", (symbol, signal.direction)).fetchone()
                 if row["active"]:
+                    self.db.execute("DELETE FROM pending_signals WHERE symbol=?", (symbol,))
                     if signal.kind == "sustained":
                         self.db.execute("UPDATE episodes SET kind='sustained' WHERE symbol=? AND direction=?", (symbol, signal.direction))
                 else:
+                    if signal.kind == "fast" and not self._confirm_fast(symbol, signal.direction, now_ms, config):
+                        self.db.execute("COMMIT")
+                        return None
                     day = datetime.fromtimestamp(now_ms / 1000, ZoneInfo(config.timezone)).date().isoformat()
                     count = self.db.execute("SELECT count(*) FROM alerts WHERE day=? AND status != 'suppressed'", (day,)).fetchone()[0]
                     cooling = row["last_alert"] is not None and now_ms - row["last_alert"] < config.cooldown_seconds * 1000

@@ -56,11 +56,20 @@ def run_demo(config: Config):
             bars, minutes, now = scenario(tail, forming)
             obs = detect(symbol, bars, minutes, now, cfg)
             first = state.observe(symbol, obs, now, cfg)
-            again = state.observe(symbol, obs, now + 1000, cfg)
-            print(f"\n{symbol}: first_alert={first}, repeat_alert={again}")
-            if first:
+            confirmed = None
+            elapsed = 0
+            # Illustrate the state machine with a synthetic signal that remains valid.
+            if obs.signal and first is None:
+                while elapsed < cfg.fast_confirmation_seconds:
+                    elapsed += cfg.scan_seconds
+                    obs = replace(obs, signal=replace(obs.signal, detected_ms=now + elapsed * 1000))
+                    confirmed = state.observe(symbol, obs, now + elapsed * 1000, cfg)
+            again = state.observe(symbol, obs, now + elapsed * 1000 + 1000, cfg)
+            print(f"\n{symbol}: first_alert={first}, confirmed_alert={confirmed}, repeat_alert={again}")
+            alert_id = first or confirmed
+            if alert_id:
                 print(format_message(obs.signal, cfg.timezone).split("https://")[0]
                       .replace("数据来源：Binance Futures", "数据来源：合成数据（非真实行情）"))
-                state.finish(first, "console")
+                state.finish(alert_id, "console")
     finally:
         state.close()

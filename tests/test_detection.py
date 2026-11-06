@@ -103,12 +103,14 @@ def test_rolling_window_uses_minute_prices():
 
 
 def test_sample_config():
-    assert len(load('config.toml').symbols) == 20
+    cfg = load('config.toml')
+    assert cfg.symbols and len(cfg.symbols) == len(set(cfg.symbols))
 
 
 @pytest.mark.parametrize('kwargs', [dict(interval='7m'), dict(scan_seconds=0), dict(directions=['long']),
                                   dict(history_bars=20), dict(symbols=['BTCUSDT', 'BTCUSDT']),
-                                  dict(detection=Detection(er_min=2)), dict(detection=Detection(atr_period=1))])
+                                  dict(detection=Detection(er_min=2)), dict(detection=Detection(atr_period=1)),
+                                  dict(detection=Detection(fast_er_min=1.1)), dict(fast_confirmation_seconds=-1)])
 def test_config_validation(kwargs):
     with pytest.raises(ValueError): Config(**kwargs)
 
@@ -130,3 +132,27 @@ def test_configurable_intervals(interval, ms):
     # 1m scenarios need at least 65 minutes; the synthetic main history provides this.
     signal = detect('TESTUSDT', *scenario(interval_ms=ms), Config(interval=interval)).signal
     assert signal and signal.direction == 'up'
+
+
+@pytest.mark.parametrize('direction', [1, -1])
+def test_fast_rejects_large_but_choppy_minute_path(direction):
+    b, m, now = scenario((100, 100, 100), 100 + direction * 2.5)
+    indexes = m.index[m.time >= b.time.iloc[-1]]
+    values = 100 + direction * np.array([1.8, -.8, 2.1, -.5, 2.3, 0, 2.4, 2.5])
+    assert len(indexes) == len(values)
+    m.loc[indexes, 'close'] = values
+    m.loc[indexes, 'high'] = m.loc[indexes, ['open', 'close']].max(axis=1) + .01
+    m.loc[indexes, 'low'] = m.loc[indexes, ['open', 'close']].min(axis=1) - .01
+    # Recreate the previous ER-unfiltered behavior while keeping the new ATR threshold.
+    old = Config(detection=Detection(fast_er_min=.001))
+    assert detect('TESTUSDT', b, m, now, old).signal is not None
+    assert detect('TESTUSDT', b, m, now, Config()).signal is None
+
+
+def test_fast_requires_two_atr_even_with_clean_path():
+    b, m, now = scenario((100, 100, 100), 101.8)
+    b['high'] = b[['open', 'close']].max(axis=1) + .49
+    b['low'] = b[['open', 'close']].min(axis=1) - .49
+    old = Config(detection=Detection(fast_atr=1.5))
+    assert detect('TESTUSDT', b, m, now, old).signal.kind == 'fast'
+    assert detect('TESTUSDT', b, m, now, Config()).signal is None

@@ -29,7 +29,8 @@ def test_upgrade_silent():
     obs, now = observation()
     fast = replace(obs, signal=replace(obs.signal, kind='fast', source='forming'))
     state = State(':memory:')
-    assert state.observe('TESTUSDT', fast, now, Config())
+    assert state.observe('TESTUSDT', fast, now, Config()) is None
+    assert state.observe('TESTUSDT', fast, now + 60_000, Config())
     assert state.observe('TESTUSDT', obs, now + 60_000, Config()) is None
     assert state.db.execute("select kind from episodes where direction='up'").fetchone()[0] == 'sustained'
     state.close()
@@ -154,4 +155,70 @@ def test_forward_only_minute_replay_one_alert_per_episode():
     assert [direction for _, direction in alerts] == ['up', 'down']
     assert alerts[0][0] <= 1530
     assert alerts[1][0] <= 1720
+    state.close()
+
+
+def fast_observation():
+    b, m, now = scenario((100, 100, 100), 102.5)
+    return detect('TESTUSDT', b, m, now, Config()), now
+
+
+def test_fast_waits_then_sends_once_after_restart(tmp_path):
+    obs, now = fast_observation()
+    path = tmp_path / 'confirm.db'
+    cfg = Config()
+    state = State(path)
+    assert state.observe('TESTUSDT', obs, now, cfg) is None
+    assert state.db.execute('select count(*) from alerts').fetchone()[0] == 0
+    assert state.observe('TESTUSDT', obs, now + 1000, cfg) is None
+    state.close()
+    state = State(path)
+    assert state.observe('TESTUSDT', obs, now + 60_000, cfg)
+    assert state.observe('TESTUSDT', obs, now + 120_000, cfg) is None
+    assert state.db.execute('select count(*) from pending_signals').fetchone()[0] == 0
+    state.close()
+
+
+def test_fast_disappearing_candidate_does_not_consume_episode_or_limit():
+    obs, now = fast_observation()
+    state = State(':memory:')
+    cfg = Config()
+    assert state.observe('TESTUSDT', obs, now, cfg) is None
+    empty = replace(obs, signal=None)
+    state.observe('TESTUSDT', empty, now + 60_000, cfg)
+    assert state.observe('TESTUSDT', obs, now + 120_000, cfg) is None
+    assert state.db.execute('select count(*) from alerts').fetchone()[0] == 0
+    assert state.db.execute('select sum(active) from episodes').fetchone()[0] == 0
+    assert state.observe('TESTUSDT', obs, now + 180_000, cfg)
+    state.close()
+
+
+def test_fast_direction_change_and_gap_restart_confirmation():
+    obs, now = fast_observation()
+    state = State(':memory:')
+    cfg = Config()
+    state.observe('TESTUSDT', obs, now, cfg)
+    down = replace(obs, signal=replace(obs.signal, direction='down'))
+    assert state.observe('TESTUSDT', down, now + 60_000, cfg) is None
+    # Missing next scan invalidates confirmation, even though enough wall time passed.
+    assert state.observe('TESTUSDT', down, now + 180_000, cfg) is None
+    assert state.observe('TESTUSDT', down, now + 240_000, cfg)
+    state.close()
+
+
+def test_pending_fast_can_be_confirmed_immediately_by_closed_trend():
+    obs, now = fast_observation()
+    state = State(':memory:')
+    cfg = Config()
+    assert state.observe('TESTUSDT', obs, now, cfg) is None
+    sustained = replace(obs, signal=replace(obs.signal, kind='sustained', source='closed'))
+    assert state.observe('TESTUSDT', sustained, now + 1000, cfg)
+    assert state.db.execute('select count(*) from pending_signals').fetchone()[0] == 0
+    state.close()
+
+
+def test_confirmation_can_be_disabled():
+    obs, now = fast_observation()
+    state = State(':memory:')
+    assert state.observe('TESTUSDT', obs, now, Config(fast_confirmation_seconds=0))
     state.close()
