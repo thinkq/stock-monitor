@@ -5,9 +5,9 @@ scan_seconds = 60
 history_bars = 200
 max_data_age_seconds = 180
 base_url = "https://fapi.binance.com"
-# 本机系统 DNS 解析异常；使用 DoH 动态解析，仍校验 Binance TLS 证书。
-# 如需 HTTPS_PROXY，设为 false；DoH 模式对 Binance 使用直接连接。
-dns_over_https = true
+# 本机直连 Binance 正常时保持 false（每次 cron 运行都省掉一次 DoH + TLS）。
+# 若直连再次出现 DNS 解析异常，改回 true 作为应用内 DoH 兜底。
+dns_over_https = false
 database = "data/monitor.sqlite3"
 timezone = "Asia/Shanghai"
 directions = ["up", "down"]

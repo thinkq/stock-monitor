@@ -5,3 +5,6 @@ __pycache__/
 data/
 .env
 *.sqlite3*
+
+# 聊天/CLI 改配置产生的本地覆盖
+config.local.toml

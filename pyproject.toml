@@ -14,6 +14,8 @@ dev = ["pytest>=8,<10"]
 
 [project.scripts]
 market-monitor = "market_monitor.app:main"
+market-monitor-hermes = "market_monitor.hermes:main"
+mm = "market_monitor.admin:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

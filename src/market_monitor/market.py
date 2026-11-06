@@ -82,12 +82,24 @@ class Binance:
             raise MarketError("server clock not initialized")
         return int(self.clock[0] + (time.monotonic() - self.clock[1]) * 1000)
 
-    def validate_symbols(self, symbols):
+    def active_symbols(self):
         info = self.get("/fapi/v1/exchangeInfo")
-        active = {s["symbol"] for s in info["symbols"] if s["status"] == "TRADING"}
+        return {s["symbol"] for s in info["symbols"] if s["status"] == "TRADING"}
+
+    def symbol_info(self, symbol):
+        """One contract's exchangeInfo entry; works whether or not the endpoint filters by symbol."""
+        data = self.get("/fapi/v1/exchangeInfo", symbol=symbol)
+        for item in data.get("symbols", []):
+            if item.get("symbol") == symbol:
+                return item
+        raise MarketError(f"标的不存在: {symbol}")
+
+    def validate_symbols(self, symbols):
+        active = self.active_symbols()
         invalid = sorted(set(symbols) - active)
         if invalid:
             raise MarketError(f"标的不存在或不可交易: {', '.join(invalid)}")
+        return active
 
 COLUMNS = ["time", "open", "high", "low", "close", "volume", "close_time", "trades"]
 

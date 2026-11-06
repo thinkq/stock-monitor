@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -87,9 +88,78 @@ class Config:
         return INTERVALS[self.interval]
 
 
-def load(path: str) -> Config:
+def local_path(path: str | Path) -> Path:
+    """config.toml → config.local.toml: the overlay chat edits are written to."""
+    base = Path(path)
+    return base.with_name(base.stem + ".local.toml")
+
+
+def read_base(path: str | Path) -> dict:
     with Path(path).open("rb") as f:
-        raw = tomllib.load(f)
-    raw["detection"] = Detection(**raw.get("detection", {}))
-    raw["telegram"] = Telegram(**raw.get("telegram", {}))
+        return tomllib.load(f)
+
+
+def load_overrides(path: str | Path) -> dict:
+    overlay = local_path(path)
+    if not overlay.exists():
+        return {}
+    return read_base(overlay)
+
+
+def _merge(base: dict, overlay: dict) -> dict:
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    raise ValueError(f"unsupported overlay value: {value!r}")
+
+
+def dump_overrides(overrides: dict) -> str:
+    """Serialize the overlay file: scalars first, then tables (TOML requirement)."""
+    scalars = {k: v for k, v in overrides.items() if not isinstance(v, dict)}
+    tables = {k: v for k, v in overrides.items() if isinstance(v, dict)}
+    lines = ["# 由 market-monitor config 写入；删除本文件即回到 config.toml 的值。", ""]
+    lines += [f"{key} = {_toml_value(value)}" for key, value in scalars.items()]
+    for name, table in tables.items():
+        lines += ["", f"[{name}]"]
+        lines += [f"{key} = {_toml_value(value)}" for key, value in table.items()]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def save_overrides(path: str | Path, overrides: dict) -> Path:
+    overlay = local_path(path)
+    overlay.parent.mkdir(parents=True, exist_ok=True)
+    overlay.write_text(dump_overrides(overrides), encoding="utf-8")
+    return overlay
+
+
+def _reject_unknown(raw: dict, allowed, where: str) -> None:
+    unknown = sorted(set(raw) - set(allowed))
+    if unknown:
+        raise ValueError(f"{where} 有未知配置项：{', '.join(unknown)}")
+
+
+def load(path: str | Path) -> Config:
+    raw = _merge(read_base(path), load_overrides(path))
+    _reject_unknown(raw, Config.__dataclass_fields__, f"{Path(path).name} / {local_path(path).name}")
+    for section, section_type in (("detection", Detection), ("telegram", Telegram)):
+        value = raw.get(section, {})
+        if not isinstance(value, dict):
+            raise ValueError(f"[{section}] 必须是表")
+        _reject_unknown(value, section_type.__dataclass_fields__, f"[{section}]")
+        raw[section] = section_type(**value)
     return Config(**raw)

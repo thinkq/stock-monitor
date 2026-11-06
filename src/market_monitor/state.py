@@ -27,10 +27,57 @@ class State:
                 detected_ms INTEGER, day TEXT, payload TEXT, status TEXT, detail TEXT);
             CREATE TABLE IF NOT EXISTS pending_signals (
                 symbol TEXT PRIMARY KEY, direction TEXT, first_seen INTEGER, last_seen INTEGER);
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS config_changes (
+                id INTEGER PRIMARY KEY, ts TEXT, key TEXT, old_value TEXT,
+                new_value TEXT, source TEXT);
         """)
 
     def close(self):
         self.db.close()
+
+    def get_meta(self, key):
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        try:
+            return json.loads(row["value"])
+        except ValueError:
+            return None
+
+    def set_meta(self, key, value):
+        self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
+                        (key, json.dumps(value, ensure_ascii=False)))
+
+    def log_config_change(self, key, old, new, source="cli"):
+        self.db.execute(
+            "INSERT INTO config_changes(ts,key,old_value,new_value,source) VALUES (?,?,?,?,?)",
+            (datetime.now().isoformat(timespec="seconds"), key,
+             json.dumps(old, ensure_ascii=False), json.dumps(new, ensure_ascii=False), source))
+
+    def recent_config_changes(self, limit=10):
+        return self.db.execute(
+            "SELECT ts,key,old_value,new_value,source FROM config_changes ORDER BY id DESC LIMIT ?",
+            (limit,)).fetchall()
+
+    def get_symbol_cache(self):
+        """(fetched_at, trading symbol set) or None; corrupt values are ignored."""
+        row = self.db.execute("SELECT value FROM meta WHERE key='active_symbols'").fetchone()
+        if row is None:
+            return None
+        try:
+            data = json.loads(row["value"])
+            return float(data["fetched_at"]), set(map(str, data["symbols"]))
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    def set_symbol_cache(self, symbols, fetched_at):
+        self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('active_symbols', ?)",
+                        (json.dumps({"fetched_at": fetched_at, "symbols": sorted(symbols)}),))
+
+    def clear_symbol_cache(self):
+        self.db.execute("DELETE FROM meta WHERE key='active_symbols'")
 
     def clear_pending(self, symbol=None):
         """A failed observation interrupts confirmation, not an already alerted episode."""

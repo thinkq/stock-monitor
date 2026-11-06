@@ -4,6 +4,28 @@ Python 3.11+ 的独立行情报警程序。按配置扫描多个 USDⓈ-M Future
 
 **网络修复：已定位本机系统 DNS 异常，项目提供应用内 DNS over HTTPS 解析，保留 Binance HTTPS 域名和证书校验。实际验证结果见 [VALIDATION.md](VALIDATION.md)。** 每次启动仍通过 exchangeInfo 检查全部标的。Telegram 未提供凭证，未进行真实消息投递。
 
+## Hermes 运行（推荐）
+
+项目支持交由 Hermes 定时扫描和投递，无信号时静默，不调用大模型。
+使用 `market-monitor-hermes --config /绝对路径/config.toml`；部署步骤见
+[integrations/hermes/README.md](integrations/hermes/README.md)。策略、行情校验及 SQLite 去重继续保留。
+
+聊天里或终端里管理监控，不必动基础配置文件（`mm` 已装进 ~/.local/bin，任何目录可用）：
+
+```bash
+mm                  # 状态总览（同 mm status）
+mm help             # 全部命令
+mm list             # 生效配置，标出哪些来自本地覆盖
+mm add NVDA         # 校验后加入，写入 config.local.toml 并记审计
+mm del APP          # 移除，历史告警保留
+mm check CRWV       # 只查：成交额、ATR、按现阈值大约多久触发一次
+mm reset [key]      # 撤销本地覆盖
+mm audit            # 改动记录
+```
+
+改动写进 `config.local.toml`（已 gitignore），基础 `config.toml` 保持不动；每轮扫描重新读取，
+不需要重启。检测阈值不开放给命令行改写，只能回测后再改。
+
 ## 安装与运行
 
 ```bash
@@ -13,20 +35,22 @@ source .venv/bin/activate
 python -m pip install -e '.[dev]'
 
 # 不依赖网络，不发送 Telegram：合成上涨、下跌、横盘、盘中位移、反转
-market-monitor demo
+mm demo
 
 # 自动化测试
 python -m pytest -q
 
 # 第一步：验证真实接口、所有配置标的及指标，保存 CSV
-market-monitor verify --config config.toml
+mm verify
 
 # 完成一次真实扫描；默认只在控制台报警
-market-monitor once --config config.toml
+mm once
 
 # 持续运行；Ctrl-C 退出
-market-monitor run --config config.toml
+mm run
 ```
+
+`mm` 与 `market-monitor` 是同一个命令（`mm` 已装到 `~/.local/bin`，任何目录都能用，配置文件位置固定）。
 
 支持 `python -m market_monitor` 的同等命令。TA-Lib 的现代 Python wheel 通常自带 C 库；如果当前 Python／操作系统没有匹配 wheel，需要先按 [TA-Lib Python 安装说明](https://github.com/TA-Lib/ta-lib-python#installation) 安装底层 TA-Lib，再安装项目。无需 Binance API Key。本机系统 DNS 曾把 Binance 域名解析到异常地址，示例配置已开启 `dns_over_https = true`：通过 Google 的 HTTPS DNS 动态查询 A 记录，按 TTL 缓存并在连接失败时尝试其他返回地址；不写死 IP、不修改系统 DNS 或 hosts、不关闭 TLS 证书校验。首次 DNS／TLS 建连较慢时会重新采样服务器时间，仍要求采样耗时不超过 5 秒。
 

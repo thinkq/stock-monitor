@@ -24,6 +24,27 @@ def format_message(signal: Signal, timezone="Asia/Shanghai"):
             f"https://www.binance.com/en/futures/{signal.symbol}")
 
 
+def format_chat_alert(signal: Signal, timezone="Asia/Shanghai"):
+    """One titled block per alert, same shape as the Crypto EMA Watch push."""
+    direction = "上涨" if signal.direction == "up" else "下跌"
+    kind = "快速" if signal.kind == "fast" else "持续单边"
+    icon = "📈" if signal.direction == "up" else "📉"
+    stamp = datetime.fromtimestamp(signal.detected_ms / 1000, ZoneInfo(timezone)).strftime("%Y-%m-%d %H:%M")
+    formed = "已完成K线" if signal.source == "closed" else "未收盘提前"
+    return (f"{icon} **{signal.symbol}**\n\n"
+            f"💰 当前价：{signal.price:.10g}\n"
+            f"📊 涨跌幅：15m {signal.changes[15]:+.2f}%｜30m {signal.changes[30]:+.2f}%｜60m {signal.changes[60]:+.2f}%\n"
+            f"📈 单边效率：ER {signal.er:.2f}｜位移 {signal.atr_units:.2f}×ATR\n"
+            f"🧭 ADX：{signal.adx:.1f}（辅助）\n"
+            f"⏱️ 类型：{kind}{direction} · {formed}\n"
+            f"🕐 提醒时间：{stamp}")
+
+
+def format_alert_batch(signals, timezone="Asia/Shanghai"):
+    """Alerts from one scan, separated the way the EMA Watch batches them."""
+    return "\n\n---\n\n".join(format_chat_alert(s, timezone) for s in signals)
+
+
 class Notifier:
     def __init__(self, config: Config, client=None):
         self.config = config

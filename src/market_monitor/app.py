@@ -1,9 +1,11 @@
 import argparse
 import logging
+import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
-from .config import load
+from .config import Config, load
 from .detection import detect
 from .market import Binance, CandleCache, MarketError, RateLimited
 from .notify import Notifier
@@ -16,6 +18,7 @@ class Monitor:
     def __init__(self, config, api, state, notifier):
         self.config, self.api, self.state, self.notifier = config, api, state, notifier
         self.cache = CandleCache()
+        self.last_errors = {}
 
     def scan_symbol(self, symbol):
         cfg, api = self.config, self.api
@@ -47,6 +50,7 @@ class Monitor:
             self.state.clear_pending()
             raise
         good = 0
+        self.last_errors = {}
         for symbol in self.config.symbols:
             try:
                 obs = self.scan_symbol(symbol)
@@ -56,6 +60,7 @@ class Monitor:
                 self.state.clear_pending()
                 raise  # one global backoff, not 20 independent retry storms
             except (MarketError, KeyError, TypeError, ValueError) as exc:
+                self.last_errors[symbol] = str(exc)
                 self.state.clear_pending(symbol)
                 LOG.warning("%s skipped: %s", symbol, exc)
         return good
@@ -78,24 +83,41 @@ def verify(config, api, output):
         print(f"VERIFIED {symbol}: {len(frame)} candles; indicators ready; signal={obs.signal.kind if obs.signal else 'none'}")
 
 
-def main():
+def resolve_paths(config: "Config", config_path: Path):
+    """Anchor relative database/output paths at the config file, not the caller's cwd."""
+    database = Path(config.database).expanduser()
+    if not database.is_absolute():
+        database = config_path.parent / database
+    return replace(config, database=str(database.resolve()))
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"status", "config", "help", "list", "ls", "add", "del",
+                            "delete", "rm", "check", "reset", "audit"}:
+        from .admin import main as admin_main
+        return admin_main(argv)
     parser = argparse.ArgumentParser(description="Binance Futures 行情异动监控（无交易功能）")
     parser.add_argument("command", choices=["run", "once", "verify", "demo"], nargs="?", default="run")
     parser.add_argument("--config", default="config.toml")
     parser.add_argument("--output", default="data/verification")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # Telegram URLs contain Bot tokens.
     api = state = notifier = None
     try:
-        config = load(args.config)
+        config_path = Path(args.config).expanduser().resolve()
+        config = resolve_paths(load(config_path), config_path)
         if args.command == "demo":
             from .demo import run_demo
             run_demo(config)
             return 0
+        output = Path(args.output).expanduser()
+        if not output.is_absolute():
+            output = config_path.parent / output
         api = Binance(config.base_url, dns_over_https=config.dns_over_https)
         if args.command == "verify":
-            verify(config, api, args.output)
+            verify(config, api, output)
             return 0
         # Fail clearly before running if a requested symbol is not trading.
         api.validate_symbols(config.symbols)
