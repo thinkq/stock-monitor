@@ -151,3 +151,17 @@ class State:
 
     def finish(self, alert_id, status, detail=None):
         self.db.execute("UPDATE alerts SET status=?,detail=? WHERE id=?", (status, detail, alert_id))
+
+    def prune_alerts(self, cutoff_day: str) -> int:
+        """Drop alerts older than cutoff_day (YYYY-MM-DD, inclusive of that day)."""
+        return self.db.execute("DELETE FROM alerts WHERE day < ?", (cutoff_day,)).rowcount
+
+    def prune_config_changes(self, keep: int = 200) -> int:
+        return self.db.execute(
+            "DELETE FROM config_changes WHERE id NOT IN "
+            "(SELECT id FROM config_changes ORDER BY id DESC LIMIT ?)", (int(keep),)).rowcount
+
+    def vacuum(self) -> None:
+        # Deleting rows leaves pages allocated; only VACUUM returns space to the filesystem.
+        self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.db.execute("VACUUM")

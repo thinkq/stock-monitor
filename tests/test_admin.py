@@ -244,3 +244,47 @@ def test_market_monitor_entry_delegates_admin_actions(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert app.main(['list']) == 0
     assert app.main(['help']) == 0
+
+
+def test_prune_deletes_only_alerts_past_retention(tmp_path, monkeypatch, capsys):
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    from market_monitor.state import State
+
+    path = write_config(tmp_path)
+    database = tmp_path / 'data/monitor.sqlite3'
+    today = datetime.now(ZoneInfo('Asia/Shanghai')).date()
+    old, mid = (today - timedelta(days=400)).isoformat(), (today - timedelta(days=60)).isoformat()
+    state = State(database)
+    for day in (old, mid, today.isoformat()):
+        state.db.execute(
+            "INSERT INTO alerts(symbol,direction,kind,detected_ms,day,payload,status) "
+            "VALUES ('BTCUSDT','up','fast',0,?,'{}','emitted')", (day,))
+    state.db.execute("INSERT INTO episodes(symbol,direction,active) VALUES ('BTCUSDT','up',1)")
+    state.close()
+
+    monkeypatch.chdir(tmp_path)
+    assert admin.main(['prune', '90']) == 0
+    assert '删除 1 条' in capsys.readouterr().out
+
+    state = State(database)
+    try:
+        days = [row[0] for row in state.db.execute("SELECT day FROM alerts ORDER BY day")]
+        assert days == [mid, today.isoformat()]
+        assert state.db.execute("SELECT count(*) FROM episodes").fetchone()[0] == 1
+    finally:
+        state.close()
+
+
+def test_prune_rejects_zero_days(tmp_path, monkeypatch, capsys):
+    write_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    assert admin.main(['prune', '0']) == 1
+    assert '至少 1 天' in capsys.readouterr().out
+
+
+def test_prune_without_database_is_harmless(tmp_path, monkeypatch, capsys):
+    write_config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    assert admin.main(['prune']) == 0
+    assert '没有需要清理' in capsys.readouterr().out

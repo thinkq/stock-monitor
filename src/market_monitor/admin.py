@@ -1,8 +1,9 @@
-"""Non-scanning commands: status, config edits (with audit) and help."""
+"""Non-scanning commands: status, config edits (with audit), prune and help."""
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import re
+import sqlite3
 import sys
 from zoneinfo import ZoneInfo
 
@@ -15,6 +16,7 @@ from .market import Binance, MarketError
 from .state import State
 
 DEFAULT_CONFIG = "config.toml"
+DEFAULT_RETENTION_DAYS = 180
 SYMBOL_RE = re.compile(r"[A-Z0-9_]{3,30}")
 
 
@@ -379,12 +381,72 @@ def cmd_config_audit(config_path: Path, limit: int = 20) -> int:
     return _print(lines)
 
 
+def _human_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def _db_size(database: Path) -> int:
+    total = 0
+    for suffix in ("", "-wal"):
+        candidate = Path(str(database) + suffix)
+        if candidate.exists():
+            total += candidate.stat().st_size
+    return total
+
+
+def cmd_prune(config_path: Path, days=None) -> int:
+    config = load(config_path)
+    try:
+        retention = DEFAULT_RETENTION_DAYS if days is None else int(days)
+    except (TypeError, ValueError):
+        print(f"用法：mm prune [天数]，默认保留 {DEFAULT_RETENTION_DAYS} 天")
+        return 1
+    if retention < 1:
+        print("❌ 保留天数至少 1 天")
+        return 1
+    database = _db_path(config_path, config)
+    if not database.exists():
+        print("状态库还不存在，没有需要清理的数据。")
+        return 0
+    cutoff = (datetime.now(ZoneInfo(config.timezone)).date()
+              - timedelta(days=retention)).isoformat()
+    before = _db_size(database)
+    state = State(database)
+    try:
+        total = state.db.execute("SELECT count(*) FROM alerts").fetchone()[0]
+        removed = state.prune_alerts(cutoff)
+        changes = state.prune_config_changes()
+        kept = total - removed
+        try:
+            state.vacuum()
+            vacuumed = True
+        except sqlite3.OperationalError:
+            # A scan holding the write lock is not worth failing over; rows are already gone.
+            vacuumed = False
+    finally:
+        state.close()
+    after = _db_size(database)
+    lines = [f"🧹 清理完成：保留最近 {retention} 天（{cutoff} 之后）",
+             f"告警：删除 {removed} 条，保留 {kept} 条",
+             f"配置改动：删除 {changes} 条，保留最近 200 条",
+             f"占用：{_human_size(before)} → {_human_size(after)}"
+             + ("" if vacuumed else "（库被扫描占用，跳过收缩，数据已删除）"),
+             f"数据库：{database}"]
+    return _print(lines)
+
+
 HELP = """📖 mm 命令（任何目录都能用）
 
 mm — 状态总览
 mm help — 这份说明
 mm list — 生效配置和覆盖来源
 mm audit — 最近的配置改动
+mm prune — 清理旧告警，默认保留 180 天
 mm add NVDA — 加入标的
 mm add NVDA APP — 一次加多个
 mm del APP — 移除标的
@@ -421,7 +483,7 @@ def _split_config(argv):
 
 
 ACTIONS = {"help", "status", "list", "ls", "add", "del", "delete", "rm",
-           "check", "reset", "audit", "run", "once", "verify", "demo"}
+           "check", "reset", "audit", "prune", "run", "once", "verify", "demo"}
 
 
 def main(argv=None) -> int:
@@ -481,6 +543,8 @@ def _dispatch(action, params, config_path):
         return cmd_config_check(config_path, params)
     if action == "reset":
         return cmd_config_reset(config_path, params[0] if params else None)
+    if action == "prune":
+        return cmd_prune(config_path, params[0] if params else None)
     if action in {"run", "once", "verify", "demo"}:
         from .app import main as app_main
         return app_main([action, "--config", str(config_path), *params])

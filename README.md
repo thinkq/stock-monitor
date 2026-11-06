@@ -21,6 +21,7 @@ mm del APP          # 移除，历史告警保留
 mm check CRWV       # 只查：成交额、ATR、按现阈值大约多久触发一次
 mm reset [key]      # 撤销本地覆盖
 mm audit            # 改动记录
+mm prune [天数]     # 清理旧告警，默认保留 180 天；删完会 VACUUM 收缩文件
 ```
 
 改动写进 `config.local.toml`（已 gitignore），基础 `config.toml` 保持不动；每轮扫描重新读取，

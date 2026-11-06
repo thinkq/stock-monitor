@@ -74,6 +74,7 @@ mm del APP          # 移除标的并清理其 episode/pending
 mm check CRWV       # 只查不改，看成交额与粗估触发密度
 mm reset [key]      # 撤销本地覆盖
 mm audit            # 改动审计
+mm prune [天数]     # 清理旧告警，默认保留 180 天
 mm help             # 命令清单
 ```
 
