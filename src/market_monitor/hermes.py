@@ -54,32 +54,24 @@ class HermesNotifier:
 
     def send_notice(self, text):
         """系统级提示：与告警共用 stdout，cron 会一起投递。"""
-        return self.send_batch_text([text])
-
-    def send_batch_text(self, texts):
-        try:
-            prefix = "" if self.sent == 0 else "---\n\n"
-            self.stream.write(prefix + "\n\n---\n\n".join(texts) + "\n\n")
-            self.stream.flush()
-            self.sent += len(texts)
-        except OSError:
-            self.failed = True
-            raise RuntimeError("Hermes output failed or uncertain") from None
-        return "emitted"
+        return self._write(text, 1)
 
     def send_batch(self, signals):
         """一轮的多条告警：同向达到阈值时输出一条板块级消息，否则逐块拼装。"""
+        minimum = self.config.merge_min_symbols
+        if minimum >= 2 and len(signals) >= minimum:
+            text = format_sector_alert(signals, self.config.timezone)
+        else:
+            text = "\n\n---\n\n".join(format_chat_alert(s, self.config.timezone) for s in signals)
+        return self._write(text, len(signals))
+
+    def _write(self, text, count):
+        """唯一写路径：块间空一行 + 分隔线，与 EMA Watch 的批布局一致。"""
         try:
-            # Matches the EMA Watch batch layout: blank line, rule, next block.
             prefix = "" if self.sent == 0 else "---\n\n"
-            minimum = self.config.merge_min_symbols
-            if minimum >= 2 and len(signals) >= minimum:
-                text = format_sector_alert(signals, self.config.timezone)
-            else:
-                text = "\n\n---\n\n".join(format_chat_alert(s, self.config.timezone) for s in signals)
             self.stream.write(prefix + text + "\n\n")
             self.stream.flush()
-            self.sent += len(signals)
+            self.sent += count
         except OSError:
             self.failed = True
             raise RuntimeError("Hermes output failed or uncertain") from None
@@ -137,8 +129,12 @@ def main(argv=None):
                 errors = getattr(monitor, "last_errors", None)
                 if not isinstance(errors, dict):
                     errors = {}
+                now = time.time()
+                previous = state.get_meta("last_scan") or {}
                 state.set_meta("last_scan", {
-                    "ts": time.time(),
+                    "ts": now,
+                    # 记录实际间隔：cron 的 "every 1m" 实测是 ~120 秒，写入后 mm 能直接看出来。
+                    "gap_s": round(now - float(previous["ts"]), 1) if previous.get("ts") else None,
                     "good": good,
                     "total": len(config.symbols),
                     "duration_ms": int((time.monotonic() - started) * 1000),

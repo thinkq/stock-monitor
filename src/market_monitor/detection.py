@@ -225,6 +225,53 @@ def threshold_snapshot(config: Config) -> dict:
     return out
 
 
+def sustained_path(closes, price, atr, config: Config):
+    """2–4 根窗口里最短的一条合格单边路径：返回 (direction, count, path, delta)。
+
+    检测与 `mm check` 的离线估算共用这一份判定。以前 admin 里另写了一套，
+    漏了两条腿，把 SOXL 的频率高估了 5 倍——判定只应该有一个实现。
+    """
+    d = config.detection
+    for count in (2, 3, 4):
+        path = closes[-count - 1:]
+        delta = path[-1] - path[0]
+        sign = 1 if delta > 0 else -1
+        direction = "up" if sign > 0 else "down"
+        steps = np.diff(path) * sign
+        # 至少两根同向收盘、允许小幅回撤、最后一根仍在推进。
+        # 不校验 ER：count=2 时两步必然同向，ER 恒为 1.0，从未拦到过候选（见 README）。
+        if (direction in config.directions and steps[-1] > 0 and (steps > 0).sum() >= 2
+                and (price - closes[-1]) * sign >= -d.pullback_atr * atr
+                and steps.min() >= -d.pullback_atr * atr
+                and abs(delta / path[0]) * 100 >= d.sustained_pct
+                and abs(delta) / atr >= d.sustained_atr):
+            return direction, count, path, delta
+    return None
+
+
+def fast_match(current, bases, changes, minutes, now_ms, price, atr, config: Config):
+    """盘中提前信号：当前 K 线或 15/30 分钟窗口的位移，要求 ATR 位移 + 分钟路径 ER。
+
+    返回 (direction, window, base, er) 或 None。ER 在这里仍有效：1 分钟路径点数多、
+    ER 有真实分布，能滤掉来回震荡（与 sustained 那边已退化的 ER 不同）。
+    """
+    d = config.detection
+    candidates = [(0, float(current.open), (price / float(current.open) - 1) * 100),
+                  (15, bases[15], changes[15]), (30, bases[30], changes[30])]
+    for window, base, pct in candidates:
+        threshold = d.fast_30_pct if window == 30 else d.fast_15_pct
+        direction = "up" if pct > 0 else "down"
+        if (direction not in config.directions or abs(pct) < threshold
+                or abs(price - base) / atr < d.fast_atr):
+            continue
+        start = now_ms - window * 60_000 if window else int(current.time)
+        path = minutes.loc[minutes.time >= start, "close"].to_numpy(dtype=float)
+        er = efficiency(np.r_[base, path])
+        if er >= d.fast_er_min:
+            return direction, window, base, er
+    return None
+
+
 def detect(symbol, candles, minutes, now_ms, config: Config) -> Observation:
     validate_frame(candles, config.interval_ms, now_ms)
     validate_frame(minutes, 60_000, now_ms)
@@ -250,52 +297,32 @@ def detect(symbol, candles, minutes, now_ms, config: Config) -> Observation:
 
     def make(direction, kind, source, er, units, evidence, window=0, vol=None,
              window_closes=(), basis="close_path"):
-        return Signal(symbol, direction, kind, source, price, changes, er, units,
-                      adx, plus, minus, now_ms, evidence, window, vol, expansion,
-                      current_session, taker, thresholds=thresholds, atr=atr, er_basis=basis,
-                      closes=[float(x) for x in window_closes],
+        return Signal(symbol=symbol, direction=direction, kind=kind, source=source,
+                      price=price, changes=changes, er=er, atr_units=units, adx=adx,
+                      plus_di=plus, minus_di=minus, detected_ms=now_ms, evidence_ms=evidence,
+                      window=window, vol_ratio=vol, atr_expansion=expansion,
+                      session=current_session, taker_buy_ratio=taker, thresholds=thresholds,
+                      atr=atr, er_basis=basis, closes=[float(x) for x in window_closes],
                       vol_quote=float(quote_volume[-4:].sum()))
 
     sustained = None
-    for count in (2, 3, 4):
-        p = closes[-count - 1:]
-        delta = p[-1] - p[0]
-        sign = 1 if delta > 0 else -1
-        direction = "up" if sign > 0 else "down"
-        steps = np.diff(p) * sign
-        # At least two advancing closes; small pullbacks allowed; latest close still advances.
-        # 不再校验效率 ER：count=2 时两步必须同向，ER 恒为 1.0，该门槛在 170 个
-        # 历史候选上从未拦到任何一条（详见 README「为什么停用 er_min」）。ER 仅作展示。
-        if (direction in config.directions and steps[-1] > 0 and (steps > 0).sum() >= 2
-                and (price - closes[-1]) * sign >= -d.pullback_atr * atr
-                and steps.min() >= -d.pullback_atr * atr
-                and abs(delta / p[0]) * 100 >= d.sustained_pct
-                and abs(delta) / atr >= d.sustained_atr):
-            # 量能固定用 60 分钟（4 根）累计：单根 15m 在薄盘上噪声太大（CV>1.5）
-            sustained = make(direction, "sustained", "closed", efficiency(p), abs(delta) / atr, last,
-                             window=count, vol=volume_ratio(closed, 4, sessions),
-                             window_closes=p)
-            break
+    match = sustained_path(closes, price, atr, config)
+    if match:
+        direction, count, path, delta = match
+        # 量能固定用 60 分钟（4 根）累计：单根 15m 在薄盘上噪声太大（CV>1.5）
+        sustained = make(direction, "sustained", "closed", efficiency(path), abs(delta) / atr, last,
+                         window=count, vol=volume_ratio(closed, 4, sessions),
+                         window_closes=path)
 
-    fast = None
-    # Include current candle displacement even when the longer window is dominated by a reversal.
+    # 当前 K 线的位移也要算：长窗口被反转主导时，盘中插针仍应提前提醒。
     current = candles.iloc[-1]
-    candidates = [(0, float(current.open), (price / float(current.open) - 1) * 100),
-                  (15, bases[15], changes[15]), (30, bases[30], changes[30])]
-    for window, base, pct in candidates:
-        threshold = d.fast_30_pct if window == 30 else d.fast_15_pct
-        direction = "up" if pct > 0 else "down"
-        if (direction in config.directions and abs(pct) >= threshold
-                and abs(price - base) / atr >= d.fast_atr):
-            start = now_ms - window * 60_000 if window else int(current.time)
-            path = minutes.loc[minutes.time >= start, "close"].to_numpy(dtype=float)
-            er = efficiency(np.r_[base, path])
-            if er < d.fast_er_min:
-                continue
-            fast = make(direction, "fast", "forming", er, abs(price - base) / atr,
-                        int(current.time), vol=volume_ratio(closed, 4, sessions),
-                        window_closes=(base, price), basis="minute_path")
-            break
+    fast = None
+    match = fast_match(current, bases, changes, minutes, now_ms, price, atr, config)
+    if match:
+        direction, _window, base, er = match
+        fast = make(direction, "fast", "forming", er, abs(price - base) / atr,
+                    int(current.time), vol=volume_ratio(closed, 4, sessions),
+                    window_closes=(base, price), basis="minute_path")
     # A fast opposite move supersedes a now-obsolete completed-candle direction.
     chosen = fast if fast and sustained and fast.direction != sustained.direction else sustained or fast
     return Observation(chosen, bool(quiet and chosen is None), last)

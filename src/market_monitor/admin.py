@@ -11,6 +11,7 @@ import numpy as np
 import talib
 
 from .config import Config, load, load_overrides, local_path, save_overrides
+from .detection import sustained_path
 from .market import Binance, MarketError
 from .state import State
 
@@ -99,10 +100,12 @@ def cmd_status(config_path: Path) -> int:
         scan = state.get_meta("last_scan") or {}
         if scan:
             stamp = datetime.fromtimestamp(float(scan.get("ts") or 0), tz).strftime("%m-%d %H:%M:%S")
+            gap = scan.get("gap_s")
+            cadence = f"　实测间隔 {float(gap):.0f} 秒" if gap else ""
             lines += [
                 "",
                 f"最近一轮：{stamp}　{scan.get('good')}/{scan.get('total')} 成功"
-                f"　耗时 {float(scan.get('duration_ms') or 0) / 1000:.1f} 秒",
+                f"　耗时 {float(scan.get('duration_ms') or 0) / 1000:.1f} 秒{cadence}",
             ]
             errors = scan.get("errors") or {}
             if errors:
@@ -191,25 +194,13 @@ def _bars_stats(bars: list, config: Config) -> dict:
     moves = np.abs(close[:-1] / open_[:-1] - 1) * 100
     fast_hits = int((moves >= d.fast_15_pct).sum())
     flags = np.zeros(len(close), dtype=bool)
-    # 逐根复现 sustained：必须带上 ATR 位移与回撤两条腿，否则高波动标的的频率会被高估数倍。
+    # 直接复用生产的 sustained_path：估算器自己再写一套判定，已经漂移过一次（SOXL 高估 5 倍）。
     for i in range(d.atr_period + 6, len(close)):
         baseline = atr_series[i - 4]
         if not np.isfinite(baseline) or baseline <= 0:
             continue
-        for count in (2, 3, 4):
-            path = close[i - count:i + 1]
-            delta = path[-1] - path[0]
-            if delta == 0:
-                continue
-            sign = 1.0 if delta > 0 else -1.0
-            steps = np.diff(path) * sign
-            # 与生产检测保持一致：不校验 ER（该门槛从未拦到候选）；当前价 vs 最后收盘无法在离线估算。
-            if (steps[-1] > 0 and (steps > 0).sum() >= 2
-                    and steps.min() >= -d.pullback_atr * baseline
-                    and abs(delta / path[0]) * 100 >= d.sustained_pct
-                    and abs(delta) / baseline >= d.sustained_atr):
-                flags[i] = True
-                break
+        if sustained_path(close[:i + 1], close[i], float(baseline), config):
+            flags[i] = True
     starts = int((flags[1:-1] & ~flags[:-2]).sum())
     hours = max(1e-9, (len(close) - 1) * config.interval_ms / 3_600_000)
     return {

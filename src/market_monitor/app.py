@@ -11,7 +11,7 @@ from .config import Config, load
 from .detection import detect
 from .market import Binance, CandleCache, MarketError, RateLimited
 from .notify import Notifier
-from .state import State
+from .state import State, day_of
 
 LOG = logging.getLogger(__name__)
 
@@ -19,6 +19,11 @@ LOG = logging.getLogger(__name__)
 def _number(value):
     """只接受真实数值；Mock 或异常类型一律视为缺失，避免污染 payload 与 JSON 序列化。"""
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def minute_bars(config):
+    """拉多少根 1 分钟 K 线：至少 65 根（覆盖 60 分钟位移 + 1 根确认）。"""
+    return max(65, config.history_bars) if config.interval == "1m" else 65
 
 
 def breadth_of(symbol, direction, seen, total):
@@ -75,7 +80,7 @@ class Monitor:
     def scan_symbol(self, symbol):
         cfg, api = self.config, self.api
         candles = self.cache.refresh(api, symbol, cfg.interval, cfg.interval_ms, cfg.history_bars)
-        minutes = self.cache.refresh(api, symbol, "1m", 60_000, max(65, cfg.history_bars) if cfg.interval == "1m" else 65)
+        minutes = self.cache.refresh(api, symbol, "1m", 60_000, minute_bars(cfg))
         # Last-trade time provides a freshness check in addition to candle timestamps.
         ticker = api.get("/fapi/v2/ticker/price", symbol=symbol)
         now = api.now_ms()
@@ -120,13 +125,12 @@ class Monitor:
 
     def prune_once(self):
         """每轮开头尝试一次（内部按天去重），老告警不会无限堆积。"""
-        today = datetime.fromtimestamp(self.api.now_ms() / 1000,
-                                       ZoneInfo(self.config.timezone)).date().isoformat()
+        today = day_of(self.api.now_ms(), self.config.timezone)
         removed = self.state.maybe_prune(today, self.config.retention_days)
         if removed:
             LOG.info("pruned %s alerts older than %s days", removed, self.config.retention_days)
 
-    def flush(self):
+    def _flush(self):
         """一轮结束统一投递：同向达到阈值就合并成一条板块消息，不再逐条刷屏。"""
         pending, self.pending = self.pending, []
         if not pending:
@@ -137,12 +141,12 @@ class Monitor:
         minimum = self.config.merge_min_symbols
         for items in groups.values():
             if minimum >= 2 and len(items) >= minimum:
-                self.deliver_batch(items)
+                self._deliver_batch(items)
             else:
                 for alert_id, signal in items:
-                    self.deliver(alert_id, signal)
+                    self._deliver(alert_id, signal)
 
-    def deliver(self, alert_id, signal):
+    def _deliver(self, alert_id, signal):
         try:
             status = self.notifier.send(signal)
         except RuntimeError:
@@ -152,7 +156,7 @@ class Monitor:
         else:
             self.state.finish(alert_id, status)
 
-    def deliver_batch(self, items):
+    def _deliver_batch(self, items):
         try:
             status = self.notifier.send_batch([signal for _alert, signal in items])
         except RuntimeError:
@@ -191,7 +195,7 @@ class Monitor:
         finally:
             # 即使本轮中途被限流中止，已经预留的告警也必须发出去，不能烂在 reserved 里。
             self.prev_signals = dict(self.round_signals)
-            self.flush()
+            self._flush()
         self.check_health(good)
         return good
 
@@ -203,7 +207,7 @@ def verify(config, api, output):
     Path(output).mkdir(parents=True, exist_ok=True)
     for symbol in config.symbols:
         frame = cache.refresh(api, symbol, config.interval, config.interval_ms, config.history_bars)
-        minutes = cache.refresh(api, symbol, "1m", 60_000, max(65, config.history_bars) if config.interval == "1m" else 65)
+        minutes = cache.refresh(api, symbol, "1m", 60_000, minute_bars(config))
         ticker = api.get("/fapi/v2/ticker/price", symbol=symbol)
         if not -5000 <= api.now_ms() - int(ticker["time"]) <= config.max_data_age_seconds * 1000:
             raise MarketError("stale ticker during verification")

@@ -1,4 +1,4 @@
-"""SQLite episode state and atomic notification reservation (at-most-once attempts)."""
+"""SQLite episode 状态与"至多一次"的告警预约。"""
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 import json
@@ -8,6 +8,23 @@ from zoneinfo import ZoneInfo
 
 from .config import Config
 from .detection import Observation, Signal
+
+
+def day_of(now_ms: int, timezone: str) -> str:
+    """按配置时区取自然日，冷却与每日额度都按这个口径。"""
+    return datetime.fromtimestamp(now_ms / 1000, ZoneInfo(timezone)).date().isoformat()
+
+
+def origin_price(signal: Signal) -> float:
+    """被报那段位移的起点价。
+
+    不能取报警瞬间的价格：否则累计位移从 0 起算，而 announced_atr 是 atr_units，
+    两个尺度不同，升级永远追不上。
+    """
+    if signal.closes:
+        return float(signal.closes[0])
+    sign = 1.0 if signal.direction == "up" else -1.0
+    return signal.price - sign * signal.atr_units * signal.atr
 
 
 @dataclass(frozen=True)
@@ -102,14 +119,16 @@ class State:
             self.db.execute("DELETE FROM pending_signals WHERE symbol=?", (symbol,))
 
     def _confirm_fast(self, symbol, direction, now_ms, config):
-        """Confirmation survives restarts, but expires across missing scans."""
+        """快速信号确认：跨重启保留，跨过缺失的扫描就作废。"""
         row = self.db.execute("SELECT * FROM pending_signals WHERE symbol=?", (symbol,)).fetchone()
         if config.fast_confirmation_seconds == 0:
             self.db.execute("DELETE FROM pending_signals WHERE symbol=?", (symbol,))
             return True
         # 宽容窗口取标称扫描周期的 3 倍：cron 的"every 1m"实际约 2 分钟才触发一次，
         # 用 1.5 倍（90 秒）会让每次扫描都被判定为"断档"，快速信号永远等不到确认。
-        if row is None or row["direction"] != direction or not 0 <= now_ms - row["last_seen"] <= config.scan_seconds * 3000:
+        fresh = (row is not None and row["direction"] == direction
+                 and 0 <= now_ms - row["last_seen"] <= config.scan_seconds * 3000)
+        if not fresh:
             self.db.execute("INSERT OR REPLACE INTO pending_signals VALUES (?,?,?,?)",
                             (symbol, direction, now_ms, now_ms))
             return False
@@ -119,117 +138,143 @@ class State:
         self.db.execute("UPDATE pending_signals SET last_seen=? WHERE symbol=?", (now_ms, symbol))
         return False
 
+    def _escalation_peak(self, row, signal):
+        """从 episode 起点算到现在的累计有利位移（ATR 倍数），单调不降。"""
+        announced = row["announced_atr"] or 0.0
+        origin_price, origin_atr = row["origin_price"] or 0.0, row["origin_atr"] or 0.0
+        if announced <= 0 or origin_price <= 0 or origin_atr <= 0 or not signal.atr:
+            return None, 0.0           # 首报被限流挡过，或基准缺失：不可升级
+        sign = 1.0 if signal.direction == "up" else -1.0
+        move = (signal.price - origin_price) * sign / origin_atr
+        return announced, max(row["peak_atr"] or 0.0, move)
+
     def _escalate(self, symbol, signal, row, now_ms, config):
         """同一波行情没结束、但位移明显扩大时补一条升级提醒。
 
         基准固定为 episode 起点价与报警时的 ATR：用当前 ATR 会让波动率扩张反过来压低倍数，
-        升级时刻就变得不可解释。不受 cooldown_seconds 约束（30 分钟间隔已足够），只受日限约束。
+        升级时刻就变得不可解释。不受 cooldown_seconds 约束（30 分钟间隔已足够），只受升级配额约束。
         """
         if config.escalation_atr <= 0 or config.escalation_seconds <= 0:
             return None
-        announced = row["announced_atr"] or 0.0
-        origin_price, origin_atr = row["origin_price"] or 0.0, row["origin_atr"] or 0.0
-        if announced <= 0 or origin_price <= 0 or origin_atr <= 0 or not signal.atr:
-            return None          # 首报被限流挡过，或基准缺失：不升级
-        sign = 1.0 if signal.direction == "up" else -1.0
-        move = (signal.price - origin_price) * sign / origin_atr
-        peak = max(row["peak_atr"] or 0.0, move)
+        announced, peak = self._escalation_peak(row, signal)
+        if announced is None:
+            return None
         if (peak - announced < config.escalation_atr
                 or now_ms - (row["last_alert"] or 0) < config.escalation_seconds * 1000):
             self.db.execute("UPDATE episodes SET peak_atr=? WHERE symbol=? AND direction=?",
                             (peak, symbol, signal.direction))
             return None
-        day = datetime.fromtimestamp(now_ms / 1000, ZoneInfo(config.timezone)).date().isoformat()
+        day = day_of(now_ms, config.timezone)
         # 升级有自己的配额：它是已播报过那波行情的延续，不该挤掉新事件的额度。
-        count = self.db.execute("SELECT count(*) FROM alerts WHERE day=? AND status != 'suppressed' "
-                                "AND kind='escalation'", (day,)).fetchone()[0]
-        if count >= config.escalation_daily_limit:
-            return None          # 配额满不落库也不推进档位，配额空了还能补
+        if self._today_count(day, kind="escalation") >= config.escalation_daily_limit:
+            return None            # 配额满不落库也不推进档位，配额空了还能补
         # 消息里要显示"累计位移从 2.2 扩到 4.7"，所以 atr_units 换成累计值 peak。
-        payload = replace(signal, kind="escalation",
-                          escalation_from=float(announced), atr_units=peak)
-        cursor = self.db.execute(
-            "INSERT INTO alerts(symbol,direction,kind,detected_ms,day,payload,status,detail) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (symbol, signal.direction, "escalation", now_ms, day,
-             json.dumps(asdict(payload), ensure_ascii=False), "reserved",
-             f"from {announced:.2f}xATR"))
+        payload = replace(signal, kind="escalation", escalation_from=float(announced), atr_units=peak)
+        cursor = self._insert_alert(symbol, payload, now_ms, day, "reserved",
+                                    f"from {announced:.2f}xATR")
         self.db.execute("UPDATE episodes SET peak_atr=?,announced_atr=?,last_alert=?,kind='escalation' "
                         "WHERE symbol=? AND direction=?",
                         (peak, peak, now_ms, symbol, signal.direction))
         return Reserved(cursor.lastrowid, payload)
 
     def observe(self, symbol: str, obs: Observation, now_ms: int, config: Config):
-        """Only call with fresh, fully validated data. Returns reserved alert id or None."""
+        """只有数据新鲜且校验通过时才调用；返回 Reserved 或 None。"""
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            for direction in ("up", "down"):
-                self.db.execute("INSERT OR IGNORE INTO episodes(symbol,direction) VALUES (?,?)", (symbol, direction))
-                row = self.db.execute("SELECT * FROM episodes WHERE symbol=? AND direction=?", (symbol, direction)).fetchone()
-                if obs.closed_time > row["last_bar"]:
-                    consecutive = obs.closed_time - row["last_bar"] == config.interval_ms
-                    count = (row["quiet_count"] if consecutive else 0) + 1 if obs.quiet else 0
-                    active = row["active"] if count < config.reset_bars else 0
-                    if active:
-                        self.db.execute("UPDATE episodes SET active=?,quiet_count=?,last_bar=? "
-                                        "WHERE symbol=? AND direction=?",
-                                        (active, count, obs.closed_time, symbol, direction))
-                    else:
-                        # 一轮结束就丢掉升级基准：否则下一波会拿上一波的起点算倍数，产生假升级。
-                        self.db.execute("UPDATE episodes SET active=0,quiet_count=?,last_bar=?,"
-                                        "origin_price=0,origin_atr=0,peak_atr=0,announced_atr=0 "
-                                        "WHERE symbol=? AND direction=?",
-                                        (count, obs.closed_time, symbol, direction))
-                elif not obs.quiet:
-                    self.db.execute("UPDATE episodes SET quiet_count=0 WHERE symbol=? AND direction=?", (symbol, direction))
-            signal = obs.signal
-            alert_id = None
-            if signal is None or signal.kind != "fast":
-                self.db.execute("DELETE FROM pending_signals WHERE symbol=?", (symbol,))
-            if signal:
-                row = self.db.execute("SELECT * FROM episodes WHERE symbol=? AND direction=?", (symbol, signal.direction)).fetchone()
-                if row["active"]:
-                    self.db.execute("DELETE FROM pending_signals WHERE symbol=?", (symbol,))
-                    if signal.kind == "sustained":
-                        self.db.execute("UPDATE episodes SET kind='sustained' WHERE symbol=? AND direction=?", (symbol, signal.direction))
-                    alert_id = self._escalate(symbol, signal, row, now_ms, config)
-                else:
-                    if signal.kind == "fast" and not self._confirm_fast(symbol, signal.direction, now_ms, config):
-                        self.db.execute("COMMIT")
-                        return None
-                    day = datetime.fromtimestamp(now_ms / 1000, ZoneInfo(config.timezone)).date().isoformat()
-                    count = self.db.execute("SELECT count(*) FROM alerts WHERE day=? AND status != 'suppressed' "
-                                            "AND kind != 'escalation'", (day,)).fetchone()[0]
-                    cooling = row["last_alert"] is not None and now_ms - row["last_alert"] < config.cooldown_seconds * 1000
-                    allowed = not cooling and count < config.daily_limit
-                    status = "reserved" if allowed else "suppressed"
-                    detail = "cooldown" if cooling else "daily_limit" if not allowed else None
-                    cursor = self.db.execute("INSERT INTO alerts(symbol,direction,kind,detected_ms,day,payload,status,detail) VALUES (?,?,?,?,?,?,?,?)",
-                                             (symbol, signal.direction, signal.kind, now_ms, day, json.dumps(asdict(signal), ensure_ascii=False), status, detail))
-                    if allowed:
-                        # 起点取"这次被报的那段位移的起点"，不是报警那一刻的价格：
-                        # 否则 move 从 0 起算、announced 却是 atr_units，两边不同尺度，永远追不上。
-                        sign = 1.0 if signal.direction == "up" else -1.0
-                        origin = (signal.closes[0] if signal.closes
-                                  else signal.price - sign * signal.atr_units * signal.atr)
-                        self.db.execute(
-                            "UPDATE episodes SET active=1,kind=?,quiet_count=0,last_alert=?,"
-                            "origin_price=?,origin_atr=?,peak_atr=?,announced_atr=? "
-                            "WHERE symbol=? AND direction=?",
-                            (signal.kind, now_ms, origin, signal.atr,
-                             signal.atr_units, signal.atr_units, symbol, signal.direction))
-                        alert_id = Reserved(cursor.lastrowid, signal)
-                    else:
-                        # 首报被冷却/日限压住时同样清空基准：没有"已播报位移"，就没有升级可言。
-                        self.db.execute("UPDATE episodes SET active=1,kind=?,quiet_count=0,"
-                                        "origin_price=0,origin_atr=0,peak_atr=0,announced_atr=0 "
-                                        "WHERE symbol=? AND direction=?",
-                                        (signal.kind, symbol, signal.direction))
+            self._advance_episodes(symbol, obs, config)
+            reserved = self._reserve(symbol, obs.signal, now_ms, config)
             self.db.execute("COMMIT")
-            return alert_id
+            return reserved
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+
+    def _episode(self, symbol, direction):
+        return self.db.execute("SELECT * FROM episodes WHERE symbol=? AND direction=?",
+                               (symbol, direction)).fetchone()
+
+    def _advance_episodes(self, symbol, obs, config):
+        """推进 up/down 两条 episode 的平静计数；一轮结束时丢掉升级基准。"""
+        for direction in ("up", "down"):
+            self.db.execute("INSERT OR IGNORE INTO episodes(symbol,direction) VALUES (?,?)",
+                            (symbol, direction))
+            row = self._episode(symbol, direction)
+            if obs.closed_time > row["last_bar"]:
+                consecutive = obs.closed_time - row["last_bar"] == config.interval_ms
+                quiet = (row["quiet_count"] if consecutive else 0) + 1 if obs.quiet else 0
+                if quiet < config.reset_bars:
+                    self.db.execute("UPDATE episodes SET active=?,quiet_count=?,last_bar=? "
+                                    "WHERE symbol=? AND direction=?",
+                                    (row["active"], quiet, obs.closed_time, symbol, direction))
+                else:
+                    # 一轮结束就丢掉升级基准：否则下一波会拿上一波的起点算倍数，产生假升级。
+                    self.db.execute("UPDATE episodes SET active=0,quiet_count=?,last_bar=?,"
+                                    "origin_price=0,origin_atr=0,peak_atr=0,announced_atr=0 "
+                                    "WHERE symbol=? AND direction=?",
+                                    (quiet, obs.closed_time, symbol, direction))
+            elif not obs.quiet:
+                self.db.execute("UPDATE episodes SET quiet_count=0 WHERE symbol=? AND direction=?",
+                                (symbol, direction))
+
+    def _today_count(self, day, *, kind=None, exclude_kind=None):
+        """当天已占用的额度；首报与升级分别计额，所以按 kind 过滤。"""
+        sql = "SELECT count(*) FROM alerts WHERE day=? AND status != 'suppressed'"
+        args = [day]
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        if exclude_kind:
+            sql += " AND kind!=?"
+            args.append(exclude_kind)
+        return self.db.execute(sql, args).fetchone()[0]
+
+    def _insert_alert(self, symbol, signal, now_ms, day, status, detail=None):
+        return self.db.execute(
+            "INSERT INTO alerts(symbol,direction,kind,detected_ms,day,payload,status,detail) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (symbol, signal.direction, signal.kind, now_ms, day,
+             json.dumps(asdict(signal), ensure_ascii=False), status, detail))
+
+    def _reserve(self, symbol, signal, now_ms, config):
+        """一个信号该不该报警：活跃 episode 走升级，否则走首报（冷却/日限）。"""
+        if signal is None or signal.kind != "fast":
+            self.db.execute("DELETE FROM pending_signals WHERE symbol=?", (symbol,))
+        if not signal:
+            return None
+        row = self._episode(symbol, signal.direction)
+        if row["active"]:
+            self.db.execute("DELETE FROM pending_signals WHERE symbol=?", (symbol,))
+            if signal.kind == "sustained":
+                self.db.execute("UPDATE episodes SET kind='sustained' WHERE symbol=? AND direction=?",
+                                (symbol, signal.direction))
+            return self._escalate(symbol, signal, row, now_ms, config)
+        if signal.kind == "fast" and not self._confirm_fast(symbol, signal.direction, now_ms, config):
+            return None
+        return self._reserve_first(symbol, signal, row, now_ms, config)
+
+    def _reserve_first(self, symbol, signal, row, now_ms, config):
+        """首报：受冷却与首报日限约束，并把升级基准写到 episode 上。"""
+        day = day_of(now_ms, config.timezone)
+        cooling = (row["last_alert"] is not None
+                   and now_ms - row["last_alert"] < config.cooldown_seconds * 1000)
+        allowed = not cooling and self._today_count(day, exclude_kind="escalation") < config.daily_limit
+        detail = "cooldown" if cooling else None if allowed else "daily_limit"
+        cursor = self._insert_alert(symbol, signal, now_ms, day,
+                                    "reserved" if allowed else "suppressed", detail)
+        if not allowed:
+            # 首报被冷却/日限压住时同样清空基准：没有"已播报位移"，就没有升级可言。
+            self.db.execute("UPDATE episodes SET active=1,kind=?,quiet_count=0,"
+                            "origin_price=0,origin_atr=0,peak_atr=0,announced_atr=0 "
+                            "WHERE symbol=? AND direction=?",
+                            (signal.kind, symbol, signal.direction))
+            return None
+        self.db.execute(
+            "UPDATE episodes SET active=1,kind=?,quiet_count=0,last_alert=?,"
+            "origin_price=?,origin_atr=?,peak_atr=?,announced_atr=? "
+            "WHERE symbol=? AND direction=?",
+            (signal.kind, now_ms, origin_price(signal), signal.atr,
+             signal.atr_units, signal.atr_units, symbol, signal.direction))
+        return Reserved(cursor.lastrowid, signal)
 
     def finish(self, alert_id, status, detail=None):
         self.db.execute("UPDATE alerts SET status=?,detail=? WHERE id=?", (status, detail, alert_id))
@@ -245,7 +290,7 @@ class State:
         return removed
 
     def prune_alerts(self, cutoff_day: str) -> int:
-        """Drop alerts older than cutoff_day (YYYY-MM-DD, inclusive of that day)."""
+        """删除早于 cutoff_day（含该日）的告警。"""
         return self.db.execute("DELETE FROM alerts WHERE day < ?", (cutoff_day,)).rowcount
 
     def prune_config_changes(self, keep: int = 200) -> int:
