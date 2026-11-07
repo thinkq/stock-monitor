@@ -67,9 +67,9 @@
 
 ```bash
 source .venv/bin/activate
-market-monitor verify --config config.toml
-market-monitor once --config config.toml
-market-monitor run --config config.toml
+mm verify
+mm once
+mm run
 ```
 
 ## Telegram：仅模拟验证
