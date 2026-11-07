@@ -65,11 +65,13 @@ def run_demo(config: Config):
                     obs = replace(obs, signal=replace(obs.signal, detected_ms=now + elapsed * 1000))
                     confirmed = state.observe(symbol, obs, now + elapsed * 1000, cfg)
             again = state.observe(symbol, obs, now + elapsed * 1000 + 1000, cfg)
-            print(f"\n{symbol}: first_alert={first}, confirmed_alert={confirmed}, repeat_alert={again}")
-            alert_id = first or confirmed
-            if alert_id:
+            show = lambda reserved: "—" if reserved is None else f"{reserved.signal.kind}"  # noqa: E731
+            print(f"\n{symbol}: first_alert={show(first)}, confirmed_alert={show(confirmed)}, "
+                  f"repeat_alert={show(again)}")
+            reserved = first or confirmed
+            if reserved:
                 print(format_message(obs.signal, cfg.timezone).split("https://")[0]
                       .replace("数据来源：Binance Futures", "数据来源：合成数据（非真实行情）"))
-                state.finish(alert_id, "console")
+                state.finish(reserved.alert_id, "console")
     finally:
         state.close()

@@ -11,7 +11,7 @@ import time
 from .app import Monitor
 from .config import Config, load
 from .market import Binance, MarketError
-from .notify import format_chat_alert
+from .notify import format_chat_alert, format_sector_alert
 from .state import State
 
 LOG = logging.getLogger(__name__)
@@ -50,12 +50,21 @@ class HermesNotifier:
         self.stream = stream if stream is not None else sys.stdout
 
     def send(self, signal):
+        return self.send_batch([signal])
+
+    def send_batch(self, signals):
+        """一轮的多条告警：同向达到阈值时输出一条板块级消息，否则逐块拼装。"""
         try:
             # Matches the EMA Watch batch layout: blank line, rule, next block.
             prefix = "" if self.sent == 0 else "---\n\n"
-            self.stream.write(prefix + format_chat_alert(signal, self.config.timezone) + "\n\n")
+            minimum = self.config.merge_min_symbols
+            if minimum >= 2 and len(signals) >= minimum:
+                text = format_sector_alert(signals, self.config.timezone)
+            else:
+                text = "\n\n---\n\n".join(format_chat_alert(s, self.config.timezone) for s in signals)
+            self.stream.write(prefix + text + "\n\n")
             self.stream.flush()
-            self.sent += 1
+            self.sent += len(signals)
         except OSError:
             self.failed = True
             raise RuntimeError("Hermes output failed or uncertain") from None

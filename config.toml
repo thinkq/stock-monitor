@@ -16,10 +16,19 @@ daily_limit = 30
 reset_bars = 2
 # 快速信号须在相邻有效扫描中持续满足至少 60 秒；0 可关闭确认。
 fast_confirmation_seconds = 60
+# 同一轮扫描里同方向报警 ≥ 这个数量就合并成一条"板块级"消息（0 或 1 = 不合并）。
+# 数据库仍按标的逐条记录，冷却/日限/去重语义不变，只是推送不刷屏。
+merge_min_symbols = 3
+# 同一波行情里，若位移（相对事件起点）比上次播报再扩大 1.5 倍 ATR、且相隔 30 分钟，
+# 补一条"升级"提醒。设 0 关闭。实测代价：29 条首报只多 6 条，单事件最多 2 条。
+escalation_atr = 1.5
+escalation_seconds = 1800
+# 每天自动清理一次超过这个天数的告警；0 关闭（仍可手动 mm prune）。
+retention_days = 180
 
 [detection]
-# 越小越灵敏：同时缩放百分比与 ATR 阈值，建议先用 1.0。
-sensitivity = 1.0
+# 所有阈值都是绝对值，没有全局"灵敏度"系数（旧 sensitivity 与逐项调参在数学上重复，已删除；
+# 旧 config.local.toml 里若仍有 sensitivity / er_min，程序照常加载但不生效）。
 atr_period = 14
 adx_period = 14
 fast_15_pct = 1.5
@@ -28,8 +37,7 @@ fast_atr = 2.0
 fast_er_min = 0.65
 sustained_pct = 2.0
 sustained_atr = 2.0
-# er_min 已删除：count=2 窗口下 ER 恒为 1.0，170 个历史候选从未被它拦下。
-# 旧 config.local.toml 里若仍有该键，程序仍可加载（字段保留兼容），但不参与判定。
+# sustained 不再校验 ER：count=2 窗口下 ER 恒为 1.0，170 个历史候选 0 条被它拦下。
 pullback_atr = 0.35
 quiet_pct = 0.5
 quiet_er = 0.35

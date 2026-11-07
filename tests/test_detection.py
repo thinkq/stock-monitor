@@ -41,12 +41,47 @@ def test_fast_reversal_overrides_closed_uptrend():
     assert (signal.direction, signal.kind) == ('down', 'fast')
 
 
-def test_er_gate_no_longer_blocks():
-    """ER 门槛已停用：把 er_min 抬到 1.0 也不改变任何结论（count=2 时 ER 恒为 1.0）。"""
-    b, m, now = scenario((101, 102.1, 103.2))
-    strict = Config(detection=Detection(er_min=1.0))
-    assert detect('TESTUSDT', b, m, now, strict).signal.kind == 'sustained'
-    assert detect('TESTUSDT', b, m, now, Config()).signal.kind == 'sustained'
+def test_deprecated_detection_keys_are_ignored():
+    """已删除的 sensitivity / er_min 写在旧覆盖里也不能让加载失败（否则 cron 会静默停摆）。"""
+    from market_monitor.config import Detection
+    assert not hasattr(Detection(), 'sensitivity') and not hasattr(Detection(), 'er_min')
+
+
+def test_signal_records_reproducible_absolute_values():
+    signal = detect('TESTUSDT', *scenario((101, 102.1, 103.2)), Config()).signal
+    assert signal.atr > 0
+    assert len(signal.closes) >= 3 and signal.closes[-1] == pytest.approx(signal.closes[-1])
+    assert signal.vol_quote > 0
+    assert signal.thresholds['sustained_atr'] == Config().detection.sustained_atr
+    # 全局推送参数也要进快照，否则事后无法解释当时的取舍
+    assert signal.thresholds['cooldown_seconds'] == Config().cooldown_seconds
+    assert signal.thresholds['escalation_atr'] == Config().escalation_atr
+    assert signal.thresholds['merge_min_symbols'] == Config().merge_min_symbols
+    assert set(signal.changes) == {15, 30, 60}
+
+
+def test_session_marks_us_market_holidays():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from market_monitor.detection import session_of
+    new_york = ZoneInfo('America/New_York')
+    def at(day, hour=10):
+        return int(datetime(day.year, day.month, day.day, hour, tzinfo=new_york).timestamp() * 1000)
+    from datetime import date
+    assert session_of(at(date(2026, 11, 26))) == 'holiday'   # 感恩节
+    assert session_of(at(date(2026, 4, 3))) == 'holiday'     # 耶稣受难日
+    assert session_of(at(date(2026, 7, 3))) == 'holiday'     # 7/4 落在周六，提前到周五
+    assert session_of(at(date(2026, 12, 25))) == 'holiday'
+    assert session_of(at(date(2026, 11, 25))) == 'RTH'       # 平时不受影响
+    assert session_of(at(date(2026, 11, 28))) == 'weekend'
+
+
+def test_er_basis_distinguishes_the_two_definitions():
+    from market_monitor.demo import scenario as make
+    sustained = detect('TESTUSDT', *make((101, 102.1, 103.2)), Config()).signal
+    fast = detect('TESTUSDT', *make((100, 100, 100), 102.5), Config()).signal
+    assert sustained.er_basis == 'close_path'
+    assert fast.er_basis == 'minute_path'
 
 
 def test_observability_fields_recorded_not_filtered():
@@ -119,11 +154,6 @@ def test_disallowed_direction():
     assert detect('TESTUSDT', *scenario(), Config(directions=['down'])).signal is None
 
 
-def test_sensitivity():
-    cfg = Config(detection=Detection(sensitivity=10))
-    assert detect('TESTUSDT', *scenario(), cfg).signal is None
-
-
 @pytest.mark.parametrize('damage', ['missing', 'stale', 'future', 'nan', 'invalid', 'zero', 'duplicate', 'warmup'])
 def test_bad_data_rejected(damage):
     b, m, now = scenario()
@@ -166,7 +196,7 @@ def test_er_known_values():
 def test_rolling_window_uses_minute_prices():
     b, m, now = scenario()
     s = detect('TESTUSDT', b, m, now, Config()).signal
-    for window in (15, 30, 45, 60):
+    for window in (15, 30, 60):
         past = m[m.close_time <= now - window * 60_000].iloc[-1]
         assert s.changes[window] == pytest.approx((m.close.iloc[-1] / past.close - 1) * 100)
         assert 0 <= now - window * 60_000 - past.close_time < 60_000
@@ -179,7 +209,7 @@ def test_sample_config():
 
 @pytest.mark.parametrize('kwargs', [dict(interval='7m'), dict(scan_seconds=0), dict(directions=['long']),
                                   dict(history_bars=20), dict(symbols=['BTCUSDT', 'BTCUSDT']),
-                                  dict(detection=Detection(er_min=2)), dict(detection=Detection(atr_period=1)),
+                                  dict(detection=Detection(atr_period=1)),
                                   dict(detection=Detection(fast_er_min=1.1)), dict(fast_confirmation_seconds=-1)])
 def test_config_validation(kwargs):
     with pytest.raises(ValueError): Config(**kwargs)

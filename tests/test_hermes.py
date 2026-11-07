@@ -95,6 +95,110 @@ def test_derivatives_values_recorded(tmp_path):
     state.close()
 
 
+def _monitor(tmp_path, symbols, frames, now, config=None):
+    cfg = config or Config(symbols=symbols, history_bars=len(frames[0]))
+    api = Mock()
+    api.now_ms.return_value = now
+    api.get.side_effect = lambda path, **params: {'symbol': params.get('symbol'), 'time': now}
+    state = State(tmp_path / 'state.db')
+    output = StringIO()
+    monitor = Monitor(cfg, api, state, hermes.HermesNotifier(cfg, output))
+    monitor.cache.refresh = Mock(side_effect=frames)
+    return monitor, state, output
+
+
+def test_three_same_direction_merge_into_one_sector_message(tmp_path):
+    bars, minutes, now = scenario((101, 102.1, 103.2))
+    monitor, state, output = _monitor(tmp_path, ['AUSDT', 'BUSDT', 'CUSDT'], [bars, minutes] * 3, now)
+    assert monitor.scan() == 3
+    text = output.getvalue()
+    assert text.count('板块级') == 1
+    assert '3 只同向' in text
+    for symbol in ('AUSDT', 'BUSDT', 'CUSDT'):
+        assert f'**{symbol}**' in text
+    # 不再逐条推送
+    assert '📈 **' not in text
+    rows = state.db.execute('select symbol,status,detail from alerts order by id').fetchall()
+    assert [row['detail'] for row in rows] == ['batched:3'] * 3
+    assert all(row['status'] == 'emitted' for row in rows)
+    state.close()
+
+
+def test_sector_message_uses_max_breadth_not_first_symbol(tmp_path):
+    """广度取成员最大值：先扫到的标的只看到上轮快照，不能代表全体。"""
+    from market_monitor.notify import format_sector_alert
+    from market_monitor.detection import detect
+    up, upm, now = scenario((101, 102.1, 103.2))
+    base = detect('AUSDT', up, upm, now, Config())
+    first = replace(base.signal, breadth=1, breadth_total=4)
+    second = replace(base.signal, symbol='BUSDT', breadth=4, breadth_total=4)
+    text = format_sector_alert([first, second])
+    assert '同向 4/4 只' in text
+
+
+def test_escalation_render_single_and_sector():
+    from market_monitor.detection import detect
+    from market_monitor.notify import format_chat_alert, format_sector_alert
+    bars, minutes, now = scenario((101, 102.1, 103.2))
+    base = detect('AUSDT', bars, minutes, now, Config()).signal
+    up = replace(base, kind='escalation', escalation_from=2.0, atr_units=4.2)
+    single = format_chat_alert(up)
+    assert '异动升级（上涨）' in single
+    assert '位移 2.0→4.2×ATR' in single
+    sector = format_sector_alert([up, replace(up, symbol='BUSDT')])
+    assert '板块级上涨升级（2 只同向）' in sector
+    assert '2.0→4.2×ATR' in sector
+
+
+def test_two_symbols_do_not_merge(tmp_path):
+    bars, minutes, now = scenario((101, 102.1, 103.2))
+    monitor, state, output = _monitor(tmp_path, ['AUSDT', 'BUSDT'], [bars, minutes] * 2, now)
+    assert monitor.scan() == 2
+    text = output.getvalue()
+    assert '板块级' not in text
+    assert text.count('📈 **') == 2
+    assert all(row['detail'] is None
+               for row in state.db.execute('select detail from alerts'))
+    state.close()
+
+
+def test_opposite_directions_are_counted_separately(tmp_path):
+    up, upm, now = scenario((101, 102.1, 103.2))
+    down, dm, _ = scenario((99, 97.9, 96.8))
+    monitor, state, output = _monitor(
+        tmp_path, ['AUSDT', 'BUSDT', 'CUSDT', 'DUSDT'],
+        [up, upm, up, upm, down, dm, down, dm], now)
+    assert monitor.scan() == 4
+    text = output.getvalue()
+    assert '板块级' not in text          # 2 涨 + 2 跌，各自都没到 3
+    assert '📈 **' in text and '📉 **' in text
+    state.close()
+
+
+def test_merge_can_be_disabled(tmp_path):
+    bars, minutes, now = scenario((101, 102.1, 103.2))
+    cfg = Config(symbols=['AUSDT', 'BUSDT', 'CUSDT'], history_bars=len(bars), merge_min_symbols=0)
+    monitor, state, output = _monitor(tmp_path, None, [bars, minutes] * 3, now, config=cfg)
+    assert monitor.scan() == 3
+    assert '板块级' not in output.getvalue()
+    assert output.getvalue().count('📈 **') == 3
+    state.close()
+
+
+def test_reserved_alerts_are_flushed_when_scan_aborts(tmp_path):
+    """中途限流中止也必须把已预留的告警发出去，不能烂在 reserved。"""
+    import pytest
+    from market_monitor.market import RateLimited
+    bars, minutes, now = scenario((101, 102.1, 103.2))
+    monitor, state, output = _monitor(
+        tmp_path, ['AUSDT', 'BUSDT'], [bars, minutes, RateLimited('backoff')], now)
+    with pytest.raises(RateLimited):
+        monitor.scan()
+    assert '**AUSDT**' in output.getvalue()
+    assert state.db.execute('select status from alerts').fetchone()[0] == 'emitted'
+    state.close()
+
+
 def test_overlapping_scan_skipped(tmp_path):
     with hermes.scan_lock(tmp_path / 'state.db') as first:
         with hermes.scan_lock(tmp_path / 'state.db') as second:

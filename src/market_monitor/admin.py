@@ -85,7 +85,7 @@ def cmd_status(config_path: Path) -> int:
         "",
         f"标的：{len(config.symbols)} 只　方向：{_direction_text(config.directions)}",
         f"周期：{config.interval}　扫描：每 {config.scan_seconds} 秒",
-        f"灵敏度：{config.detection.sensitivity:g}　冷却：{config.cooldown_seconds // 60} 分钟"
+        f"冷却：{config.cooldown_seconds // 60} 分钟"
         f"　每日上限：{config.daily_limit}",
         f"配置：{config_path.name}"
         + (f" + {local_path(config_path).name}（{len(_flatten(overrides))} 项覆盖）" if overrides else "（无本地覆盖）"),
@@ -151,14 +151,17 @@ def cmd_config_list(config_path: Path) -> int:
         f"daily_limit = {config.daily_limit}{marked('daily_limit')}",
         f"history_bars = {config.history_bars}{marked('history_bars')}",
         f"max_data_age_seconds = {config.max_data_age_seconds}{marked('max_data_age_seconds')}",
+        f"fast_confirmation_seconds = {config.fast_confirmation_seconds}{marked('fast_confirmation_seconds')}",
+        f"merge_min_symbols = {config.merge_min_symbols}{marked('merge_min_symbols')}",
+        f"escalation_atr = {config.escalation_atr}{marked('escalation_atr')}",
+        f"escalation_seconds = {config.escalation_seconds}{marked('escalation_seconds')}",
+        f"retention_days = {config.retention_days}{marked('retention_days')}",
         f"timezone = {config.timezone}{marked('timezone')}",
         "",
         "[detection]",
     ]
     for name, value in vars(config.detection).items():
         flag = " ← 覆盖" if name in detection_overrides else ""
-        if name == "er_min":
-            flag += " ← 已停用（不参与判定，仅保留兼容）"
         lines.append(f"  {name} = {value}{flag}")
     if overrides and "symbols" not in overrides:
         lines += ["", "（标的未覆盖，改过的是其它项）"]
@@ -180,22 +183,28 @@ def _bars_stats(bars: list, config: Config) -> dict:
     close = np.array([float(bar[4]) for bar in bars])
     open_ = np.array([float(bar[1]) for bar in bars])
     quote_volume = np.array([float(bar[7]) for bar in bars])
-    atr = talib.ATR(high, low, close, timeperiod=d.atr_period)[-1]
+    atr_series = talib.ATR(high, low, close, timeperiod=d.atr_period)
+    atr = atr_series[-1]
     moves = np.abs(close[:-1] / open_[:-1] - 1) * 100
-    fast_hits = int((moves >= d.fast_15_pct * d.sensitivity).sum())
+    fast_hits = int((moves >= d.fast_15_pct).sum())
     flags = np.zeros(len(close), dtype=bool)
-    for i in range(4, len(close)):
-        window = close[i - 3:i + 1]
+    # 逐根复现 sustained：必须带上 ATR 位移与回撤两条腿，否则高波动标的的频率会被高估数倍。
+    for i in range(d.atr_period + 6, len(close)):
+        baseline = atr_series[i - 4]
+        if not np.isfinite(baseline) or baseline <= 0:
+            continue
         for count in (2, 3, 4):
-            path = window[-(count + 1):]
+            path = close[i - count:i + 1]
             delta = path[-1] - path[0]
             if delta == 0:
                 continue
             sign = 1.0 if delta > 0 else -1.0
             steps = np.diff(path) * sign
-            # 与生产检测保持一致：不再校验 ER（该门槛从未拦到候选）。
+            # 与生产检测保持一致：不校验 ER（该门槛从未拦到候选）；当前价 vs 最后收盘无法在离线估算。
             if (steps[-1] > 0 and (steps > 0).sum() >= 2
-                    and abs(delta / path[0]) * 100 >= d.sustained_pct * d.sensitivity):
+                    and steps.min() >= -d.pullback_atr * baseline
+                    and abs(delta / path[0]) * 100 >= d.sustained_pct
+                    and abs(delta) / baseline >= d.sustained_atr):
                 flags[i] = True
                 break
     starts = int((flags[1:-1] & ~flags[:-2]).sum())

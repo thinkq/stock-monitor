@@ -109,7 +109,9 @@ class Binance:
         rate = None
         if isinstance(funding, dict) and "lastFundingRate" in funding:
             rate = float(funding["lastFundingRate"]) * 100
-        return {"oi_change": change, "funding_rate": rate}
+        # 绝对量也要留：只有变化率无法判断这个合约本身的体量。
+        latest = values[-1] if values else None
+        return {"oi_change": change, "funding_rate": rate, "oi_value": latest}
 
     def validate_symbols(self, symbols):
         active = self.active_symbols()

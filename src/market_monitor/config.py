@@ -10,9 +10,13 @@ INTERVALS = {"1m": 60_000, "3m": 180_000, "5m": 300_000,
              "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000}
 
 
+# 已删除的历史配置项：仍被接受但不生效，避免旧 config.local.toml 让整轮扫描直接失败。
+# sensitivity 与各阈值在数学上重复（它只是把 5 个阈值乘同一个系数，无法与分别调参区分）。
+DEPRECATED_DETECTION = frozenset({"sensitivity", "er_min"})
+
+
 @dataclass(frozen=True)
 class Detection:
-    sensitivity: float = 1.0
     atr_period: int = 14
     adx_period: int = 14
     fast_15_pct: float = 1.5
@@ -21,9 +25,6 @@ class Detection:
     fast_er_min: float = 0.65
     sustained_pct: float = 2.0
     sustained_atr: float = 2.0
-    # 已停用：count=2 的 sustained 窗口里 ER 恒为 1.0，该门槛从未拦到任何候选。
-    # 保留字段只为兼容旧 config.local.toml；检测逻辑不再读取（README「为什么停用 er_min」）。
-    er_min: float = 0.7
     pullback_atr: float = 0.35
     quiet_pct: float = 0.5
     quiet_er: float = 0.35
@@ -52,6 +53,14 @@ class Config:
     daily_limit: int = 30
     reset_bars: int = 2
     fast_confirmation_seconds: int = 60
+    # 同一轮扫描里同向报警达到这个数量就合并成一条板块消息；0 或 1 表示不合并。
+    merge_min_symbols: int = 3
+    # 同一波行情里位移相对 episode 起点再扩大多少倍 ATR 时补一条升级提醒；0 关闭。
+    escalation_atr: float = 1.5
+    # 两条升级提醒之间至少间隔多少秒；0 关闭升级。不受 cooldown_seconds 约束，否则会被 60 分钟冷却吞掉。
+    escalation_seconds: int = 1800
+    # 每天自动清理一次超过这个天数的告警；0 关闭（仍可手动 mm prune）。
+    retention_days: int = 180
     detection: Detection = field(default_factory=Detection)
     telegram: Telegram = field(default_factory=Telegram)
 
@@ -73,13 +82,21 @@ class Config:
             raise ValueError("cooldown_seconds must be nonnegative")
         if type(self.fast_confirmation_seconds) is not int or self.fast_confirmation_seconds < 0:
             raise ValueError("fast_confirmation_seconds must be a nonnegative integer")
+        if type(self.merge_min_symbols) is not int or self.merge_min_symbols < 0:
+            raise ValueError("merge_min_symbols must be a nonnegative integer")
+        if not isinstance(self.escalation_atr, (int, float)) or self.escalation_atr < 0:
+            raise ValueError("escalation_atr must be a nonnegative number")
+        if type(self.escalation_seconds) is not int or self.escalation_seconds < 0:
+            raise ValueError("escalation_seconds must be a nonnegative integer")
+        if type(self.retention_days) is not int or self.retention_days < 0:
+            raise ValueError("retention_days must be a nonnegative integer")
         d = self.detection
         for name, value in vars(d).items():
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"invalid detection parameter: {name}")
         if any(type(p) is not int or p < 2 for p in (d.atr_period, d.adx_period)):
             raise ValueError("indicator periods must be integers >= 2")
-        if d.er_min > 1 or d.quiet_er > 1 or d.fast_er_min > 1:
+        if d.quiet_er > 1 or d.fast_er_min > 1:
             raise ValueError("ER thresholds must be <= 1")
         if not max(70, 3 * d.adx_period, d.atr_period + 10) <= self.history_bars <= 1000:
             raise ValueError("history_bars insufficient or > 1000")
@@ -162,6 +179,10 @@ def load(path: str | Path) -> Config:
         value = raw.get(section, {})
         if not isinstance(value, dict):
             raise ValueError(f"[{section}] 必须是表")
+        if section == "detection":
+            for key in list(value):
+                if key in DEPRECATED_DETECTION:
+                    value.pop(key)   # 旧覆盖里的已删除项：忽略，不报错
         _reject_unknown(value, section_type.__dataclass_fields__, f"[{section}]")
         raw[section] = section_type(**value)
     return Config(**raw)

@@ -8,7 +8,7 @@ BASE = '''symbols = ["BTCUSDT"]
 interval = "15m"
 database = "data/monitor.sqlite3"
 [detection]
-sensitivity = 1.0
+pullback_atr = 0.35
 '''
 
 
@@ -25,12 +25,21 @@ def bars(count=200, close=100.0):
 def test_overlay_merges_and_partial_detection_section_keeps_base_values(tmp_path):
     path = write_config(tmp_path)
     save_overrides(path, {'symbols': ['BTCUSDT', 'NVDAUSDT'],
-                          'detection': {'sensitivity': 0.8}})
+                          'detection': {'pullback_atr': 0.5}})
     config = load(path)
     assert config.symbols == ['BTCUSDT', 'NVDAUSDT']
-    assert config.detection.sensitivity == 0.8
+    assert config.detection.pullback_atr == 0.5
     assert config.detection.fast_15_pct == 1.5  # untouched base value survives
-    assert load_overrides(path)['detection'] == {'sensitivity': 0.8}
+    assert load_overrides(path)['detection'] == {'pullback_atr': 0.5}
+
+
+def test_deprecated_overlay_keys_do_not_break_loading(tmp_path):
+    """旧覆盖里残留 sensitivity / er_min 时必须照常加载，否则 cron 会静默停摆。"""
+    path = write_config(tmp_path)
+    save_overrides(path, {'detection': {'sensitivity': 0.5, 'er_min': 0.9}})
+    config = load(path)
+    assert config.detection.fast_15_pct == 1.5
+    assert load_overrides(path)['detection'] == {'sensitivity': 0.5, 'er_min': 0.9}
 
 
 def test_overlay_file_is_parseable_and_gitignored_name(tmp_path):
@@ -147,15 +156,15 @@ def test_status_reads_last_scan_and_alerts(tmp_path, capsys):
 
 def test_reset_restores_base_values(tmp_path, capsys):
     path = write_config(tmp_path)
-    save_overrides(path, {'cooldown_seconds': 600, 'detection': {'sensitivity': 0.5}})
+    save_overrides(path, {'cooldown_seconds': 600, 'detection': {'pullback_atr': 0.5}})
     assert load(path).cooldown_seconds == 600
 
     assert admin.cmd_config_reset(path, 'cooldown_seconds') == 0
     assert load(path).cooldown_seconds == 3600
-    assert load(path).detection.sensitivity == 0.5
+    assert load(path).detection.pullback_atr == 0.5
 
-    assert admin.cmd_config_reset(path, 'detection.sensitivity') == 0
-    assert load(path).detection.sensitivity == 1.0
+    assert admin.cmd_config_reset(path, 'detection.pullback_atr') == 0
+    assert load(path).detection.pullback_atr == 0.35
     assert load_overrides(path) == {}
 
 

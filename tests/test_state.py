@@ -15,7 +15,7 @@ def test_one_episode_and_restart(tmp_path):
     path = tmp_path / 'state.db'
     obs, now = observation()
     state = State(path)
-    assert state.observe('TESTUSDT', obs, now, Config()) == 1
+    assert state.observe('TESTUSDT', obs, now, Config()).alert_id == 1
     for minute in range(60):
         assert state.observe('TESTUSDT', obs, now + minute * 60_000, Config()) is None
     state.close()
@@ -33,6 +33,110 @@ def test_upgrade_silent():
     assert state.observe('TESTUSDT', fast, now + 60_000, Config())
     assert state.observe('TESTUSDT', obs, now + 60_000, Config()) is None
     assert state.db.execute("select kind from episodes where direction='up'").fetchone()[0] == 'sustained'
+    state.close()
+
+
+def advance(obs, atr_units, cfg=Config(), minutes=30):
+    """构造"同向继续推进"的观测：价格按 ATR 倍数上移，换一根已收盘 K 线。"""
+    signal = replace(obs.signal,
+                     price=obs.signal.price + atr_units * obs.signal.atr,
+                     atr_units=obs.signal.atr_units + atr_units)
+    return replace(obs, signal=signal, quiet=False,
+                   closed_time=obs.closed_time + cfg.interval_ms), minutes * 60_000
+
+
+def test_maybe_prune_runs_once_per_day(tmp_path):
+    state = State(tmp_path / 'prune.db')
+    obs, now = observation()
+    state.observe('TESTUSDT', obs, now, Config())
+    state.db.execute("UPDATE alerts SET day='2020-01-01'")
+    assert state.maybe_prune('2026-11-07', 180) == 1
+    assert state.db.execute('select count(*) from alerts').fetchone()[0] == 0
+    assert state.maybe_prune('2026-11-07', 180) == 0      # 同一天不重复扫描
+    assert state.maybe_prune('2026-11-08', 180) == 0      # 换天再试，但没有新数据
+    assert state.maybe_prune('2026-11-09', 0) == 0        # 0 = 关闭
+    state.close()
+
+
+def test_escalation_fires_after_threshold_and_gap():
+    obs, now = observation()
+    state = State(':memory:')
+    cfg = Config()
+    first = state.observe('TESTUSDT', obs, now, cfg)
+    assert first.signal.kind == 'sustained'
+    later, delta = advance(obs, 1.6)
+    escalated = state.observe('TESTUSDT', later, now + delta, cfg)
+    assert escalated is not None
+    assert escalated.signal.kind == 'escalation'
+    assert escalated.signal.escalation_from == first.signal.atr_units
+    assert state.db.execute("select count(*) from alerts where kind='escalation'").fetchone()[0] == 1
+    state.close()
+
+
+def test_escalation_waits_for_the_gap():
+    obs, now = observation()
+    state = State(':memory:')
+    cfg = Config()
+    state.observe('TESTUSDT', obs, now, cfg)
+    later, _ = advance(obs, 1.6)
+    assert state.observe('TESTUSDT', later, now + 20 * 60_000, cfg) is None
+    assert state.observe('TESTUSDT', later, now + 30 * 60_000, cfg) is not None
+    state.close()
+
+
+def test_escalation_needs_a_bigger_move():
+    obs, now = observation()
+    state = State(':memory:')
+    cfg = Config()
+    state.observe('TESTUSDT', obs, now, cfg)
+    later, delta = advance(obs, 1.0)
+    assert state.observe('TESTUSDT', later, now + delta, cfg) is None
+    state.close()
+
+
+def test_escalation_ignores_retracement():
+    obs, now = observation()
+    state = State(':memory:')
+    cfg = Config()
+    state.observe('TESTUSDT', obs, now, cfg)
+    later = replace(obs, signal=replace(obs.signal, price=obs.signal.price - 2 * obs.signal.atr),
+                    quiet=False, closed_time=obs.closed_time + cfg.interval_ms)
+    assert state.observe('TESTUSDT', later, now + 3600_000, cfg) is None
+    state.close()
+
+
+def test_escalation_can_be_disabled():
+    obs, now = observation()
+    state = State(':memory:')
+    cfg = replace(Config(), escalation_atr=0.0)
+    state.observe('TESTUSDT', obs, now, cfg)
+    later, delta = advance(obs, 3.0)
+    assert state.observe('TESTUSDT', later, now + delta, cfg) is None
+    assert state.db.execute("select count(*) from alerts where kind='escalation'").fetchone()[0] == 0
+    state.close()
+
+
+def test_escalation_respects_daily_limit_without_inserting_rows():
+    obs, now = observation()
+    state = State(':memory:')
+    cfg = replace(Config(), daily_limit=1)
+    assert state.observe('TESTUSDT', obs, now, cfg) is not None
+    later, delta = advance(obs, 2.0)
+    assert state.observe('TESTUSDT', later, now + delta, cfg) is None
+    assert state.db.execute("select count(*) from alerts").fetchone()[0] == 1
+    state.close()
+
+
+def test_escalation_state_clears_after_reset():
+    obs, now = observation()
+    state = State(':memory:')
+    cfg = replace(Config(), cooldown_seconds=0)
+    state.observe('TESTUSDT', obs, now, cfg)
+    quiet_reset(state, obs, now, cfg)
+    later, _ = advance(obs, 3.0)
+    fresh = state.observe('TESTUSDT', later, now + 3 * cfg.interval_ms, cfg)
+    assert fresh.signal.kind == 'sustained'      # 新的一波，重新算首报
+    assert state.db.execute("select announced_atr from episodes where direction='up'").fetchone()[0] == fresh.signal.atr_units
     state.close()
 
 
@@ -155,11 +259,15 @@ def test_forward_only_minute_replay_one_alert_per_episode():
         bars['close_time'] = bars.time + 899_999
         now = int(prefix.time.iloc[-1]) + 30_000
         obs = detect('TESTUSDT', bars[COLUMNS].tail(100), prefix[COLUMNS].tail(65), now, cfg)
-        if state.observe('TESTUSDT', obs, now, cfg):
-            alerts.append((i, obs.signal.direction))
-    assert [direction for _, direction in alerts] == ['up', 'down']
-    assert alerts[0][0] <= 1530
-    assert alerts[1][0] <= 1720
+        reserved = state.observe('TESTUSDT', obs, now, cfg)
+        if reserved:
+            alerts.append((i, reserved.signal.direction, reserved.signal.kind))
+    firsts = [(i, direction) for i, direction, kind in alerts if kind != 'escalation']
+    assert [direction for _, direction in firsts] == ['up', 'down']
+    assert firsts[0][0] <= 1530
+    assert firsts[1][0] <= 1720
+    # 连续 90 分钟单边上涨里，位移会持续扩大，必须出现升级提醒
+    assert [kind for _, _, kind in alerts].count('escalation') >= 1
     state.close()
 
 

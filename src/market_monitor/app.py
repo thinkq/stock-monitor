@@ -3,7 +3,9 @@ import logging
 import sys
 import time
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .config import Config, load
 from .detection import detect
@@ -37,6 +39,8 @@ class Monitor:
         # 跨标的共振快照：本轮逐个扫，未扫到的标的用上一轮的值（最多滞后一个扫描周期）。
         self.round_signals = {}
         self.prev_signals = {}
+        # 已预留、等待投递的告警：一轮结束后统一发，才能判断要不要合并成板块消息。
+        self.pending = []
 
     def tag_derivatives(self, symbol, obs):
         """补上持仓量与资金费率。只做观测：拉取失败不改变扫描结果，也不阻塞报警。"""
@@ -52,7 +56,8 @@ class Monitor:
         if not isinstance(extra, dict):          # 单测里 api 可能是 Mock
             return obs
         return replace(obs, signal=replace(obs.signal, oi_change=_number(extra.get("oi_change")),
-                                           funding_rate=_number(extra.get("funding_rate"))))
+                                           funding_rate=_number(extra.get("funding_rate")),
+                                           oi_value=_number(extra.get("oi_value"))))
 
     def tag_breadth(self, symbol, obs):
         """给信号补上同向广度；只记录，不参与是否报警的判定。"""
@@ -79,16 +84,55 @@ class Monitor:
             raise MarketError("stale or mismatched last-trade timestamp")
         obs = self.tag_breadth(symbol, self.tag_derivatives(
             symbol, detect(symbol, candles, minutes, now, cfg)))
-        alert_id = self.state.observe(symbol, obs, now, cfg)
-        if alert_id is not None:
-            try:
-                status = self.notifier.send(obs.signal)
-            except RuntimeError:
-                self.state.finish(alert_id, "failed", "delivery failed or uncertain; no automatic resend")
-                LOG.error("%s notification delivery failed/uncertain; see SQLite alert %s", symbol, alert_id)
-            else:
-                self.state.finish(alert_id, status)
+        reserved = self.state.observe(symbol, obs, now, cfg)
+        if reserved is not None:              # 升级提醒会带回补了 escalation_from 的信号
+            self.pending.append((reserved.alert_id, reserved.signal))
         return obs
+
+    def prune_once(self):
+        """每轮开头尝试一次（内部按天去重），老告警不会无限堆积。"""
+        today = datetime.fromtimestamp(self.api.now_ms() / 1000,
+                                       ZoneInfo(self.config.timezone)).date().isoformat()
+        removed = self.state.maybe_prune(today, self.config.retention_days)
+        if removed:
+            LOG.info("pruned %s alerts older than %s days", removed, self.config.retention_days)
+
+    def flush(self):
+        """一轮结束统一投递：同向达到阈值就合并成一条板块消息，不再逐条刷屏。"""
+        pending, self.pending = self.pending, []
+        if not pending:
+            return
+        groups = {}
+        for alert_id, signal in pending:
+            groups.setdefault(signal.direction, []).append((alert_id, signal))
+        minimum = self.config.merge_min_symbols
+        for items in groups.values():
+            if minimum >= 2 and len(items) >= minimum:
+                self.deliver_batch(items)
+            else:
+                for alert_id, signal in items:
+                    self.deliver(alert_id, signal)
+
+    def deliver(self, alert_id, signal):
+        try:
+            status = self.notifier.send(signal)
+        except RuntimeError:
+            self.state.finish(alert_id, "failed", "delivery failed or uncertain; no automatic resend")
+            LOG.error("%s notification delivery failed/uncertain; see SQLite alert %s",
+                      signal.symbol, alert_id)
+        else:
+            self.state.finish(alert_id, status)
+
+    def deliver_batch(self, items):
+        try:
+            status = self.notifier.send_batch([signal for _alert, signal in items])
+        except RuntimeError:
+            for alert_id, signal in items:
+                self.state.finish(alert_id, "failed", "batch delivery failed or uncertain; no resend")
+                LOG.error("%s batch delivery failed/uncertain; see SQLite alert %s", signal.symbol, alert_id)
+        else:
+            for alert_id, _signal in items:
+                self.state.finish(alert_id, status, f"batched:{len(items)}")
 
     def scan(self):
         # Any clock failure aborts the whole scan without touching episode state.
@@ -100,19 +144,25 @@ class Monitor:
         good = 0
         self.last_errors = {}
         self.round_signals = {}
-        for symbol in self.config.symbols:
-            try:
-                obs = self.scan_symbol(symbol)
-                good += 1
-                LOG.info("%s fresh; signal=%s", symbol, obs.signal.kind if obs.signal else "none")
-            except RateLimited:
-                self.state.clear_pending()
-                raise  # one global backoff, not 20 independent retry storms
-            except (MarketError, KeyError, TypeError, ValueError) as exc:
-                self.last_errors[symbol] = str(exc)
-                self.state.clear_pending(symbol)
-                LOG.warning("%s skipped: %s", symbol, exc)
-        self.prev_signals = dict(self.round_signals)
+        self.pending = []
+        self.prune_once()
+        try:
+            for symbol in self.config.symbols:
+                try:
+                    obs = self.scan_symbol(symbol)
+                    good += 1
+                    LOG.info("%s fresh; signal=%s", symbol, obs.signal.kind if obs.signal else "none")
+                except RateLimited:
+                    self.state.clear_pending()
+                    raise  # one global backoff, not 20 independent retry storms
+                except (MarketError, KeyError, TypeError, ValueError) as exc:
+                    self.last_errors[symbol] = str(exc)
+                    self.state.clear_pending(symbol)
+                    LOG.warning("%s skipped: %s", symbol, exc)
+        finally:
+            # 即使本轮中途被限流中止，已经预留的告警也必须发出去，不能烂在 reserved 里。
+            self.prev_signals = dict(self.round_signals)
+            self.flush()
         return good
 
 
