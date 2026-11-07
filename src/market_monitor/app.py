@@ -89,6 +89,35 @@ class Monitor:
             self.pending.append((reserved.alert_id, reserved.signal))
         return obs
 
+    def check_health(self, good):
+        """扫描不完整时的心跳：连续 N 轮缺标的就说一句，避免"以为在盯着"。
+
+        只处理"部分成功"（退出码仍是 0，cron 不会报错）。整轮失败由退出码 1 通知。
+        """
+        total = len(self.config.symbols)
+        meta = self.state.get_meta("health") or {}
+        now = self.api.now_ms()
+        if good >= total:
+            if meta.get("streak", 0) >= max(self.config.health_alert_rounds, 1) and meta.get("notified_at"):
+                self.notifier.send_notice(f"✅ **监控已恢复：{total}/{total} 标的扫描成功**")
+            self.state.set_meta("health", {"streak": 0, "notified_at": None, "last_good": now})
+            return
+        streak = int(meta.get("streak", 0)) + 1
+        notified_at = meta.get("notified_at")
+        due = (self.config.health_alert_rounds > 0 and streak >= self.config.health_alert_rounds
+               and (notified_at is None or now - notified_at >= self.config.health_alert_seconds * 1000))
+        if due:
+            missing = sorted(self.last_errors)[:4]
+            detail = "、".join(missing) + ("等" if len(self.last_errors) > 4 else "")
+            self.notifier.send_notice(
+                f"⚠️ **监控不完整（连续 {streak} 轮）**\n\n"
+                f"最近一轮：{good}/{total} 成功｜{datetime.fromtimestamp(now / 1000, ZoneInfo(self.config.timezone)):%m-%d %H:%M}\n"
+                f"缺失：{detail}\n"
+                f"影响：这些标的这一轮不判异动，异动可能漏报。")
+            notified_at = now
+        self.state.set_meta("health", {"streak": streak, "notified_at": notified_at,
+                                       "last_good": meta.get("last_good")})
+
     def prune_once(self):
         """每轮开头尝试一次（内部按天去重），老告警不会无限堆积。"""
         today = datetime.fromtimestamp(self.api.now_ms() / 1000,
@@ -163,6 +192,7 @@ class Monitor:
             # 即使本轮中途被限流中止，已经预留的告警也必须发出去，不能烂在 reserved 里。
             self.prev_signals = dict(self.round_signals)
             self.flush()
+        self.check_health(good)
         return good
 
 

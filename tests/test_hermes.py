@@ -150,6 +150,41 @@ def test_escalation_render_single_and_sector():
     assert '2.0→4.2×ATR' in sector
 
 
+def test_partial_scan_sends_one_health_notice_then_recovery(tmp_path):
+    from market_monitor.market import MarketError
+    bars, minutes, now = scenario((101, 102.1, 103.2))
+    cfg = Config(symbols=['AUSDT', 'BUSDT'], history_bars=len(bars), health_alert_rounds=3)
+    api = Mock()
+    api.now_ms.return_value = now
+    api.get.side_effect = lambda path, **params: {'symbol': params.get('symbol'), 'time': now}
+    state = State(tmp_path / 'health.db')
+    output = StringIO()
+    monitor = Monitor(cfg, api, state, hermes.HermesNotifier(cfg, output))
+
+    def broken(refresh_api, symbol, interval, interval_ms, limit):
+        if symbol == 'BUSDT':
+            raise MarketError('stale or mismatched last-trade timestamp')
+        return bars if interval == '15m' else minutes
+
+    def healthy(refresh_api, symbol, interval, interval_ms, limit):
+        return bars if interval == '15m' else minutes
+
+    monitor.cache.refresh = broken
+    monitor.scan()
+    monitor.scan()
+    assert '监控不完整' not in output.getvalue()      # 前两轮不吵
+    assert monitor.scan() == 1
+    assert '监控不完整（连续 3 轮）' in output.getvalue()
+    assert 'BUSDT' in output.getvalue()
+    monitor.scan()
+    assert output.getvalue().count('监控不完整') == 1  # 间隔未到不重复
+ 
+    monitor.cache.refresh = healthy
+    monitor.scan()
+    assert '监控已恢复' in output.getvalue()
+    state.close()
+
+
 def test_two_symbols_do_not_merge(tmp_path):
     bars, minutes, now = scenario((101, 102.1, 103.2))
     monitor, state, output = _monitor(tmp_path, ['AUSDT', 'BUSDT'], [bars, minutes] * 2, now)

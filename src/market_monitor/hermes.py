@@ -52,6 +52,21 @@ class HermesNotifier:
     def send(self, signal):
         return self.send_batch([signal])
 
+    def send_notice(self, text):
+        """系统级提示：与告警共用 stdout，cron 会一起投递。"""
+        return self.send_batch_text([text])
+
+    def send_batch_text(self, texts):
+        try:
+            prefix = "" if self.sent == 0 else "---\n\n"
+            self.stream.write(prefix + "\n\n---\n\n".join(texts) + "\n\n")
+            self.stream.flush()
+            self.sent += len(texts)
+        except OSError:
+            self.failed = True
+            raise RuntimeError("Hermes output failed or uncertain") from None
+        return "emitted"
+
     def send_batch(self, signals):
         """一轮的多条告警：同向达到阈值时输出一条板块级消息，否则逐块拼装。"""
         try:

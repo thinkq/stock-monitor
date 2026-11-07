@@ -12,7 +12,9 @@ database = "data/monitor.sqlite3"
 timezone = "Asia/Shanghai"
 directions = ["up", "down"]
 cooldown_seconds = 3600
-daily_limit = 30
+# 首报每日上限。11-06 那样的一整波半导体抛压实测 30 条刚好顶满，
+# 顶满后当天剩余时间全部 suppressed 且不再补发，因此放宽到 60。
+daily_limit = 60
 reset_bars = 2
 # 快速信号须在相邻有效扫描中持续满足至少 60 秒；0 可关闭确认。
 fast_confirmation_seconds = 60
@@ -23,6 +25,11 @@ merge_min_symbols = 3
 # 补一条"升级"提醒。设 0 关闭。实测代价：29 条首报只多 6 条，单事件最多 2 条。
 escalation_atr = 1.5
 escalation_seconds = 1800
+# 升级提醒自己的每日配额，不占首报额度；0 = 不发升级。
+escalation_daily_limit = 20
+# 连续多少轮扫描不完整就推一条"监控异常"；0 关闭心跳。
+health_alert_rounds = 3
+health_alert_seconds = 1800
 # 每天自动清理一次超过这个天数的告警；0 关闭（仍可手动 mm prune）。
 retention_days = 180
 

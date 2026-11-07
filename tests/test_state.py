@@ -45,6 +45,33 @@ def advance(obs, atr_units, cfg=Config(), minutes=30):
                    closed_time=obs.closed_time + cfg.interval_ms), minutes * 60_000
 
 
+def test_no_escalation_when_first_alert_was_suppressed():
+    """首报被冷却压住时，绝不能用上一波的起点算出"升级"。"""
+    obs, now = observation()
+    state = State(':memory:')
+    cfg = Config()
+    state.observe('TESTUSDT', obs, now, cfg)                 # 第一波：正常首报
+    quiet_reset(state, obs, now, cfg)                        # 两轮平静 → 结束
+    assert state.db.execute("select announced_atr from episodes where direction='up'").fetchone()[0] == 0
+    fresh, _ = advance(obs, 0.0)                             # 第二波首报（60 分钟内，必被冷却）
+    assert state.observe('TESTUSDT', fresh, now + 2 * cfg.interval_ms, cfg) is None
+    far, delta = advance(obs, 3.0)
+    assert state.observe('TESTUSDT', far, now + 2 * cfg.interval_ms + delta, cfg) is None
+    assert state.db.execute("select count(*) from alerts where kind='escalation'").fetchone()[0] == 0
+    state.close()
+
+
+def test_fast_confirms_across_a_two_minute_gap():
+    """cron 实际约 120 秒一轮；确认流程不能因此被打断（以前 90 秒窗口会让它永远确认不了）。"""
+    obs, now = observation()
+    fast = replace(obs, signal=replace(obs.signal, kind='fast', source='forming'))
+    cfg = Config()
+    state = State(':memory:')
+    assert state.observe('TESTUSDT', fast, now, cfg) is None          # 首次候选
+    assert state.observe('TESTUSDT', fast, now + 120_000, cfg) is not None   # 120 秒后确认
+    state.close()
+
+
 def test_maybe_prune_runs_once_per_day(tmp_path):
     state = State(tmp_path / 'prune.db')
     obs, now = observation()
@@ -116,14 +143,18 @@ def test_escalation_can_be_disabled():
     state.close()
 
 
-def test_escalation_respects_daily_limit_without_inserting_rows():
+def test_escalation_has_its_own_daily_quota():
+    """首报额度用尽不影响升级（它是同一波行情的延续），升级另有自己的上限。"""
     obs, now = observation()
     state = State(':memory:')
-    cfg = replace(Config(), daily_limit=1)
-    assert state.observe('TESTUSDT', obs, now, cfg) is not None
+    cfg = replace(Config(), daily_limit=1, escalation_daily_limit=1)
+    assert state.observe('TESTUSDT', obs, now, cfg) is not None      # 首报占满唯一名额
     later, delta = advance(obs, 2.0)
-    assert state.observe('TESTUSDT', later, now + delta, cfg) is None
-    assert state.db.execute("select count(*) from alerts").fetchone()[0] == 1
+    escalated = state.observe('TESTUSDT', later, now + delta, cfg)
+    assert escalated is not None and escalated.signal.kind == 'escalation'
+    further, delta2 = advance(obs, 4.0, minutes=60)
+    assert state.observe('TESTUSDT', further, now + delta2, cfg) is None   # 升级额度 1 已用完
+    assert state.db.execute("select count(*) from alerts where kind='escalation'").fetchone()[0] == 1
     state.close()
 
 
@@ -313,9 +344,9 @@ def test_fast_direction_change_and_gap_restart_confirmation():
     state.observe('TESTUSDT', obs, now, cfg)
     down = replace(obs, signal=replace(obs.signal, direction='down'))
     assert state.observe('TESTUSDT', down, now + 60_000, cfg) is None
-    # Missing next scan invalidates confirmation, even though enough wall time passed.
-    assert state.observe('TESTUSDT', down, now + 180_000, cfg) is None
-    assert state.observe('TESTUSDT', down, now + 240_000, cfg)
+    # 间隔超过标称扫描周期的 3 倍（180 秒）才算断档：这里隔了 240 秒
+    assert state.observe('TESTUSDT', down, now + 300_000, cfg) is None
+    assert state.observe('TESTUSDT', down, now + 360_000, cfg)
     state.close()
 
 

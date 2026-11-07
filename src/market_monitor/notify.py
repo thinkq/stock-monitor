@@ -144,6 +144,10 @@ class Notifier:
     def send(self, signal):
         return self.send_text(format_message(signal, self.config.timezone))
 
+    def send_notice(self, text):
+        """系统级提示（监控不完整/恢复），不是行情告警，不占每日额度。"""
+        return self.send_text(text)
+
     def send_batch(self, signals):
         """一轮多条时的推送：板块级合并文本，或退化成逐条拼装。"""
         LOG.info("合并推送：%s 只同向，阈值 %s", len(signals), self.config.merge_min_symbols)

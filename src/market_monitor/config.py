@@ -50,7 +50,7 @@ class Config:
     timezone: str = "Asia/Shanghai"
     directions: list[str] = field(default_factory=lambda: ["up", "down"])
     cooldown_seconds: int = 3600
-    daily_limit: int = 30
+    daily_limit: int = 60
     reset_bars: int = 2
     fast_confirmation_seconds: int = 60
     # 同一轮扫描里同向报警达到这个数量就合并成一条板块消息；0 或 1 表示不合并。
@@ -61,6 +61,11 @@ class Config:
     escalation_seconds: int = 1800
     # 每天自动清理一次超过这个天数的告警；0 关闭（仍可手动 mm prune）。
     retention_days: int = 180
+    # 升级提醒自己的每日配额，不占首报 quota（首报被限流时仍能有升级）；0 = 不发升级。
+    escalation_daily_limit: int = 20
+    # 连续多少轮扫描不完整就推一条"监控异常"；0 = 关闭心跳。同一告警至少间隔 health_alert_seconds。
+    health_alert_rounds: int = 3
+    health_alert_seconds: int = 1800
     detection: Detection = field(default_factory=Detection)
     telegram: Telegram = field(default_factory=Telegram)
 
@@ -90,6 +95,12 @@ class Config:
             raise ValueError("escalation_seconds must be a nonnegative integer")
         if type(self.retention_days) is not int or self.retention_days < 0:
             raise ValueError("retention_days must be a nonnegative integer")
+        if type(self.escalation_daily_limit) is not int or self.escalation_daily_limit < 0:
+            raise ValueError("escalation_daily_limit must be a nonnegative integer")
+        if type(self.health_alert_rounds) is not int or self.health_alert_rounds < 0:
+            raise ValueError("health_alert_rounds must be a nonnegative integer")
+        if type(self.health_alert_seconds) is not int or self.health_alert_seconds < 0:
+            raise ValueError("health_alert_seconds must be a nonnegative integer")
         d = self.detection
         for name, value in vars(d).items():
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
