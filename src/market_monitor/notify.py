@@ -37,14 +37,19 @@ def breadth_text(signal: Signal) -> str:
 
 def format_message(signal: Signal, timezone="Asia/Shanghai"):
     direction = "上涨" if signal.direction == "up" else "下跌"
-    kind = "快速" if signal.kind == "fast" else "持续单边"
+    escalation = signal.kind == "escalation"
+    kind = "快速" if signal.kind == "fast" else "升级" if escalation else "持续单边"
+    head = (f"{signal.symbol} 异动升级（{direction}）" if escalation
+            else f"{signal.symbol} {kind}{direction}异动")
+    move = (f"{signal.escalation_from:.2f}→{signal.atr_units:.2f}"
+            if escalation and signal.escalation_from else f"{signal.atr_units:.2f}")
     icon = "🚀" if signal.direction == "up" else "📉"
     timestamp = datetime.fromtimestamp(signal.detected_ms / 1000, ZoneInfo(timezone)).strftime("%Y-%m-%d %H:%M:%S %Z")
     source = "已完成 K 线（趋势确认）" if signal.source == "closed" else "当前正在形成的 K 线（提前提醒，未收盘）"
     changes = "\n".join(f"最近 {m} 分钟：{signal.changes[m]:+.2f}%" for m in (15, 30, 60))
-    return (f"{icon} {signal.symbol} {kind}{direction}异动\n\n"
+    return (f"{icon} {head}\n\n"
             f"当前价格：{signal.price:.10g}\n{changes}\n"
-            f"单边效率 ER：{signal.er:.2f}（参考值）\nATR 标准化位移：{signal.atr_units:.2f}\n"
+            f"单边效率 ER：{signal.er:.2f}（参考值）\nATR 标准化位移：{move}\n"
             f"量能：{_fmt(signal.vol_ratio, '{:.1f}×')}（{session_text(signal)}同会话基准）"
             f"　波动率扩张：{_fmt(signal.atr_expansion, '{:.2f}×')}"
             f"　主动买占比：{_fmt(None if signal.taker_buy_ratio is None else signal.taker_buy_ratio * 100, '{:.1f}%')}\n"

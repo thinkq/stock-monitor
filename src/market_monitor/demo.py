@@ -7,7 +7,7 @@ import pandas as pd
 from .config import Config
 from .detection import detect
 from .market import COLUMNS
-from .notify import format_message
+from .notify import format_chat_alert, format_message
 from .state import State
 
 
@@ -43,6 +43,7 @@ def scenario(tail=(101.0, 102.1, 103.2), forming=None, interval_ms=900_000):
 
 def run_demo(config: Config):
     cfg = replace(config, interval="15m", directions=["up", "down"])
+    show = lambda reserved: "—" if reserved is None else reserved.signal.kind  # noqa: E731
     print("=== 合成数据演示；不是 Binance 实时行情；不会发送 Telegram ===")
     state = State(":memory:")
     try:
@@ -65,7 +66,6 @@ def run_demo(config: Config):
                     obs = replace(obs, signal=replace(obs.signal, detected_ms=now + elapsed * 1000))
                     confirmed = state.observe(symbol, obs, now + elapsed * 1000, cfg)
             again = state.observe(symbol, obs, now + elapsed * 1000 + 1000, cfg)
-            show = lambda reserved: "—" if reserved is None else f"{reserved.signal.kind}"  # noqa: E731
             print(f"\n{symbol}: first_alert={show(first)}, confirmed_alert={show(confirmed)}, "
                   f"repeat_alert={show(again)}")
             reserved = first or confirmed
@@ -73,5 +73,19 @@ def run_demo(config: Config):
                 print(format_message(obs.signal, cfg.timezone).split("https://")[0]
                       .replace("数据来源：Binance Futures", "数据来源：合成数据（非真实行情）"))
                 state.finish(reserved.alert_id, "console")
+
+        # 升级提醒：同一波行情在 30 分钟内又扩大 2 个 ATR，应补一条"升级"
+        bars, minutes, now = scenario()
+        obs = detect("DEMO_ESCALATE", bars, minutes, now, cfg)
+        first = state.observe("DEMO_ESCALATE", obs, now, cfg)
+        later = replace(obs,
+                        signal=replace(obs.signal, price=obs.signal.price + 2 * obs.signal.atr,
+                                       atr_units=obs.signal.atr_units + 2),
+                        closed_time=obs.closed_time + cfg.interval_ms)
+        escalated = state.observe("DEMO_ESCALATE", later, now + 1800_000, cfg)
+        print(f"\nDEMO_ESCALATE: first_alert={show(first)}, escalation={show(escalated)}")
+        if escalated:
+            print(format_chat_alert(escalated.signal, cfg.timezone)
+                  .replace("数据来源", "数据来源（合成）"))
     finally:
         state.close()
