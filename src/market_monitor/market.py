@@ -94,6 +94,23 @@ class Binance:
                 return item
         raise MarketError(f"标的不存在: {symbol}")
 
+    def derivatives(self, symbol):
+        """持仓量变化与资金费率；只用于观测，调用方负责吞掉失败。
+
+        代币成交量相对正股很小（NVDA 约 1.9%、AVGO 0.35%），用它推断"真实参与度"
+        并不可靠；OI 与资金费率是该合约本身的真实仓位与拥挤度，不依赖跨市场可比性。
+        """
+        history = self.get("/futures/data/openInterestHist", symbol=symbol, period="15m", limit=5)
+        funding = self.get("/fapi/v1/premiumIndex", symbol=symbol)
+        values = [float(item["sumOpenInterestValue"]) for item in history] if isinstance(history, list) else []
+        change = None
+        if len(values) >= 2 and values[0] > 0 and values[-1] > 0:
+            change = (values[-1] / values[0] - 1) * 100
+        rate = None
+        if isinstance(funding, dict) and "lastFundingRate" in funding:
+            rate = float(funding["lastFundingRate"]) * 100
+        return {"oi_change": change, "funding_rate": rate}
+
     def validate_symbols(self, symbols):
         active = self.active_symbols()
         invalid = sorted(set(symbols) - active)
@@ -101,12 +118,15 @@ class Binance:
             raise MarketError(f"标的不存在或不可交易: {', '.join(invalid)}")
         return active
 
-COLUMNS = ["time", "open", "high", "low", "close", "volume", "close_time", "trades"]
+# quote_volume / taker_buy_* 只用于观测（资金规模、主动买卖占比），不参与检测阈值。
+COLUMNS = ["time", "open", "high", "low", "close", "volume", "close_time", "quote_volume",
+           "trades", "taker_buy_volume", "taker_buy_quote_volume"]
 
 
 def parse_klines(rows):
     try:
-        frame = pd.DataFrame([[int(r[0]), *map(float, r[1:6]), int(r[6]), int(r[8])]
+        frame = pd.DataFrame([[int(r[0]), *map(float, r[1:6]), int(r[6]), float(r[7]),
+                               int(r[8]), float(r[9]), float(r[10])]
                               for r in rows], columns=COLUMNS)
     except (ValueError, TypeError, IndexError) as exc:
         raise MarketError("malformed klines") from exc
@@ -125,6 +145,7 @@ def validate_frame(frame, interval_ms, now_ms):
         raise MarketError("invalid candle timestamps")
     if ((frame[["open", "high", "low", "close"]] <= 0).any().any()
             or (frame.volume < 0).any() or (frame.trades < 0).any()
+            or (frame[["quote_volume", "taker_buy_volume", "taker_buy_quote_volume"]] < 0).any().any()
             or (frame.high < frame[["open", "close", "low"]].max(axis=1)).any()
             or (frame.low > frame[["open", "close", "high"]].min(axis=1)).any()):
         raise MarketError("invalid OHLCV")

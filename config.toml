@@ -28,7 +28,8 @@ fast_atr = 2.0
 fast_er_min = 0.65
 sustained_pct = 2.0
 sustained_atr = 2.0
-er_min = 0.7
+# er_min 已删除：count=2 窗口下 ER 恒为 1.0，170 个历史候选从未被它拦下。
+# 旧 config.local.toml 里若仍有该键，程序仍可加载（字段保留兼容），但不参与判定。
 pullback_atr = 0.35
 quiet_pct = 0.5
 quiet_er = 0.35

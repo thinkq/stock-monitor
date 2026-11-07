@@ -11,7 +11,6 @@ import numpy as np
 import talib
 
 from .config import Config, load, load_overrides, local_path, save_overrides
-from .detection import efficiency
 from .market import Binance, MarketError
 from .state import State
 
@@ -158,6 +157,8 @@ def cmd_config_list(config_path: Path) -> int:
     ]
     for name, value in vars(config.detection).items():
         flag = " ← 覆盖" if name in detection_overrides else ""
+        if name == "er_min":
+            flag += " ← 已停用（不参与判定，仅保留兼容）"
         lines.append(f"  {name} = {value}{flag}")
     if overrides and "symbols" not in overrides:
         lines += ["", "（标的未覆盖，改过的是其它项）"]
@@ -192,8 +193,8 @@ def _bars_stats(bars: list, config: Config) -> dict:
                 continue
             sign = 1.0 if delta > 0 else -1.0
             steps = np.diff(path) * sign
+            # 与生产检测保持一致：不再校验 ER（该门槛从未拦到候选）。
             if (steps[-1] > 0 and (steps > 0).sum() >= 2
-                    and efficiency(path) >= d.er_min
                     and abs(delta / path[0]) * 100 >= d.sustained_pct * d.sensitivity):
                 flags[i] = True
                 break

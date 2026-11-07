@@ -21,6 +21,8 @@ class Detection:
     fast_er_min: float = 0.65
     sustained_pct: float = 2.0
     sustained_atr: float = 2.0
+    # 已停用：count=2 的 sustained 窗口里 ER 恒为 1.0，该门槛从未拦到任何候选。
+    # 保留字段只为兼容旧 config.local.toml；检测逻辑不再读取（README「为什么停用 er_min」）。
     er_min: float = 0.7
     pullback_atr: float = 0.35
     quiet_pct: float = 0.5

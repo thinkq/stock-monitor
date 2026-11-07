@@ -137,7 +137,10 @@ def test_forward_only_minute_replay_one_alert_per_episode():
     minutes['high'] = minutes[['open', 'close']].max(axis=1) + .03
     minutes['low'] = minutes[['open', 'close']].min(axis=1) - .03
     minutes['volume'] = 10.
+    minutes['quote_volume'] = 10. * minutes['close']
     minutes['trades'] = 10
+    minutes['taker_buy_volume'] = 5.
+    minutes['taker_buy_quote_volume'] = 5. * minutes['close']
     minutes['close_time'] = minutes.time + 59_999
     state = State(':memory:')
     cfg = Config(cooldown_seconds=0)
@@ -146,7 +149,9 @@ def test_forward_only_minute_replay_one_alert_per_episode():
         prefix = minutes.iloc[:i + 1]
         bars = prefix.groupby(prefix.time // 900_000 * 900_000).agg(
             open=('open', 'first'), high=('high', 'max'), low=('low', 'min'),
-            close=('close', 'last'), volume=('volume', 'sum'), trades=('trades', 'sum')).reset_index()
+            close=('close', 'last'), volume=('volume', 'sum'), trades=('trades', 'sum'),
+            quote_volume=('quote_volume', 'sum'), taker_buy_volume=('taker_buy_volume', 'sum'),
+            taker_buy_quote_volume=('taker_buy_quote_volume', 'sum')).reset_index()
         bars['close_time'] = bars.time + 899_999
         now = int(prefix.time.iloc[-1]) + 30_000
         obs = detect('TESTUSDT', bars[COLUMNS].tail(100), prefix[COLUMNS].tail(65), now, cfg)

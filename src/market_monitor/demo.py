@@ -21,8 +21,8 @@ def scenario(tail=(101.0, 102.1, 103.2), forming=None, interval_ms=900_000):
     for i, price in enumerate(prices + [current]):
         opening = prices[i - 1] if i else prices[0]
         t = start + i * interval_ms
-        rows.append([t, opening, max(opening, price) + 0.08,
-                     min(opening, price) - 0.08, price, 100., t + interval_ms - 1, 100])
+        rows.append([t, opening, max(opening, price) + 0.08, min(opening, price) - 0.08,
+                     price, 100., t + interval_ms - 1, price * 100., 100, 50., price * 50.])
     candles = pd.DataFrame(rows, columns=COLUMNS)
     # Observation halfway through the mutable candle, at an exact minute boundary + 30 seconds.
     current_start = int(candles.time.iloc[-1])
@@ -37,7 +37,7 @@ def scenario(tail=(101.0, 102.1, 103.2), forming=None, interval_ms=900_000):
         opening = bar.open + (bar.close - bar.open) * progress_start
         closing = bar.open + (bar.close - bar.open) * progress_end
         minute_rows.append([t, opening, max(opening, closing) + .01, min(opening, closing) - .01,
-                            closing, 10., t + 59_999, 10])
+                             closing, 10., t + 59_999, closing * 10., 10, 5., closing * 5.])
     return candles, pd.DataFrame(minute_rows, columns=COLUMNS), now
 
 

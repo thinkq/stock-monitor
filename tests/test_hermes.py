@@ -6,6 +6,7 @@ from market_monitor import hermes
 from market_monitor.app import Monitor
 from market_monitor.config import Config, Telegram
 from market_monitor.demo import scenario
+from market_monitor.market import MarketError
 from market_monitor.state import State
 
 
@@ -25,6 +26,73 @@ def test_emits_once_and_persists_across_restart(tmp_path):
         assert state.db.execute('select status from alerts').fetchone()[0] == 'emitted'
         state.close()
     assert output.getvalue().count('**TESTUSDT**') == 1
+
+
+def test_breadth_counts_same_direction_and_excludes_self():
+    from market_monitor.app import breadth_of
+    seen = {'AUSDT': ('down', 'sustained'), 'BUSDT': ('down', 'fast'), 'CUSDT': ('up', 'sustained')}
+    assert breadth_of('AUSDT', 'down', seen, 13) == 2
+    assert breadth_of('CUSDT', 'up', seen, 13) == 1
+    assert breadth_of('DUSDT', 'up', seen, 13) == 2      # C + 自身
+    assert breadth_of('DUSDT', 'down', seen, 13) == 3
+    assert breadth_of('AUSDT', 'down', seen, 1) == 1     # 不超过配置标的数
+
+
+def test_breadth_is_recorded_in_payload_and_shown(tmp_path):
+    import json
+    bars, minutes, now = scenario()
+    cfg = Config(symbols=['AAAUSDT', 'BBBUSDT'], history_bars=len(bars))
+    output = StringIO()
+    api = Mock()
+    api.now_ms.return_value = now
+    api.get.side_effect = lambda path, **params: {'symbol': params.get('symbol'), 'time': now}
+    state = State(tmp_path / 'state.db')
+    monitor = Monitor(cfg, api, state, hermes.HermesNotifier(cfg, output))
+    monitor.cache.refresh = Mock(side_effect=[bars, minutes, bars, minutes])
+    assert monitor.scan() == 2
+    payloads = [json.loads(row[0]) for row in state.db.execute('select payload from alerts order by id')]
+    assert [p['breadth'] for p in payloads] == [1, 2]   # 第二个标的能看到第一个
+    assert all(p['breadth_total'] == 2 for p in payloads)
+    assert all(p['window'] in (2, 3, 4) for p in payloads)
+    assert all(p['vol_ratio'] is None or p['vol_ratio'] > 0 for p in payloads)
+    assert '1/2 只同向' in output.getvalue() and '2/2 只同向' in output.getvalue()
+    state.close()
+
+
+def test_derivatives_failure_never_blocks_alert(tmp_path):
+    """OI / 资金费率只是观测数据：拉取失败必须照常报警。"""
+    import json
+    bars, minutes, now = scenario()
+    cfg = Config(symbols=['TESTUSDT'], history_bars=len(bars))
+    api = Mock()
+    api.now_ms.return_value = now
+    api.get.return_value = {'symbol': 'TESTUSDT', 'time': now}
+    api.derivatives.side_effect = MarketError('openInterestHist unavailable')
+    state = State(tmp_path / 'state.db')
+    monitor = Monitor(cfg, api, state, hermes.HermesNotifier(cfg, StringIO()))
+    monitor.cache.refresh = Mock(side_effect=[bars, minutes])
+    assert monitor.scan() == 1
+    payload = json.loads(state.db.execute('select payload from alerts').fetchone()[0])
+    assert payload['oi_change'] is None and payload['funding_rate'] is None
+    assert payload['session'] in ('RTH', 'pre', 'post', 'night', 'weekend')
+    state.close()
+
+
+def test_derivatives_values_recorded(tmp_path):
+    import json
+    bars, minutes, now = scenario()
+    cfg = Config(symbols=['TESTUSDT'], history_bars=len(bars))
+    api = Mock()
+    api.now_ms.return_value = now
+    api.get.return_value = {'symbol': 'TESTUSDT', 'time': now}
+    api.derivatives.return_value = {'oi_change': -2.5, 'funding_rate': 0.0269}
+    state = State(tmp_path / 'state.db')
+    monitor = Monitor(cfg, api, state, hermes.HermesNotifier(cfg, StringIO()))
+    monitor.cache.refresh = Mock(side_effect=[bars, minutes])
+    assert monitor.scan() == 1
+    payload = json.loads(state.db.execute('select payload from alerts').fetchone()[0])
+    assert payload['oi_change'] == -2.5 and payload['funding_rate'] == 0.0269
+    state.close()
 
 
 def test_overlapping_scan_skipped(tmp_path):
@@ -77,10 +145,14 @@ def test_alert_layout_matches_ema_watch_style():
     assert lines[2].startswith('💰 当前价：')
     assert lines[3].startswith('📊 涨跌幅：')
     assert lines[4].startswith('📈 单边效率：')
-    assert lines[5].startswith('🧭 ADX：')
-    assert lines[6].startswith('⏱️ 类型：')
-    assert lines[7].startswith('🕐 提醒时间：')
-    assert len(lines) == 8
+    assert lines[5].startswith('📦 量能：')
+    assert lines[6].startswith('🧭 ADX：')
+    assert lines[7].startswith('🧩 共振：')
+    assert lines[8].startswith('⏱️ 类型：')
+    assert lines[9].startswith('🕐 提醒时间：')
+    assert len(lines) == 10
+    # 单独 detect 时没有跨标的统计，必须写明而不是显示 0
+    assert '未统计' in lines[7]
     assert format_alert_batch([sig, sig]).count('\n\n---\n\n') == 1
 
 

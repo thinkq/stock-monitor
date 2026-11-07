@@ -6,7 +6,8 @@ import talib
 
 from market_monitor.config import Config, Detection, load
 from market_monitor.demo import scenario
-from market_monitor.detection import detect, efficiency, indicators
+from market_monitor.detection import (detect, efficiency, expansion_ratio, indicators,
+                                      taker_buy_ratio, volume_ratio)
 from market_monitor.market import MarketError
 
 
@@ -38,6 +39,75 @@ def test_forming_fast_and_extreme(price, direction):
 def test_fast_reversal_overrides_closed_uptrend():
     signal = detect('TESTUSDT', *scenario((101, 102.2, 103.5), 98), Config()).signal
     assert (signal.direction, signal.kind) == ('down', 'fast')
+
+
+def test_er_gate_no_longer_blocks():
+    """ER 门槛已停用：把 er_min 抬到 1.0 也不改变任何结论（count=2 时 ER 恒为 1.0）。"""
+    b, m, now = scenario((101, 102.1, 103.2))
+    strict = Config(detection=Detection(er_min=1.0))
+    assert detect('TESTUSDT', b, m, now, strict).signal.kind == 'sustained'
+    assert detect('TESTUSDT', b, m, now, Config()).signal.kind == 'sustained'
+
+
+def test_observability_fields_recorded_not_filtered():
+    """量能 / 波动率扩张 / 命中窗口只记录，不参与判定。"""
+    signal = detect('TESTUSDT', *scenario((101, 102.1, 103.2)), Config()).signal
+    assert signal.window in (2, 3, 4)
+    assert signal.vol_ratio > 0
+    assert signal.atr_expansion > 0
+    assert (signal.breadth, signal.breadth_total) == (0, 0)
+    # 合成数据量能恒定、ATR 稳定，比值应接近 1，说明口径没有偏差
+    assert signal.vol_ratio == pytest.approx(1.0, rel=.01)
+    assert signal.atr_expansion == pytest.approx(1.0, rel=.05)
+
+
+def test_volume_ratio_scales_with_recent_volume():
+    bars, _, _ = scenario((101, 102.1, 103.2))
+    bars = bars.copy()
+    bars.loc[bars.index[-2:], 'volume'] = 300.
+    closed = bars[bars.close_time < bars.close_time.iloc[-1]]
+    # 最近 2 根 300 + 100 → 均量 200，基准中位量 100
+    assert volume_ratio(closed, 2) == pytest.approx(2.0)
+
+
+def test_session_labels_follow_new_york_clock():
+    from market_monitor.detection import session_of
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    ny = ZoneInfo('America/New_York')
+
+    def ms(*args):
+        return int(dt.datetime(*args, tzinfo=ny).timestamp() * 1000)
+
+    assert session_of(ms(2026, 11, 6, 10, 0)) == 'RTH'      # 周五 10:00 ET
+    assert session_of(ms(2026, 11, 6, 9, 29)) == 'pre'
+    assert session_of(ms(2026, 11, 6, 9, 30)) == 'RTH'
+    assert session_of(ms(2026, 11, 6, 16, 0)) == 'post'
+    assert session_of(ms(2026, 11, 6, 20, 0)) == 'night'
+    assert session_of(ms(2026, 11, 6, 23, 0)) == 'night'
+    assert session_of(ms(2026, 11, 7, 10, 0)) == 'weekend'  # 周六
+
+
+def test_volume_ratio_is_session_aware():
+    """基准只取同会话历史；跨会话的高量不能抬高基准，样本不足时返回 None。"""
+    bars, _, _ = scenario((101, 102.1, 103.2))
+    closed = bars[bars.close_time < bars.close_time.iloc[-1]].reset_index(drop=True)
+    closed.loc[:, 'volume'] = 100.
+    closed.loc[closed.index[-4:], 'volume'] = 200.          # 最近 1 小时翻倍
+    same = ['RTH'] * len(closed)
+    assert volume_ratio(closed, 4, same) == pytest.approx(2.0)
+    # 最近 1 小时与历史不同会话 → 基准里没有可比样本
+    mixed = ['night'] * (len(closed) - 4) + ['RTH'] * 4
+    assert volume_ratio(closed, 4, mixed) is None
+    # 同会话样本太少 → None 而不是 0
+    assert volume_ratio(closed.tail(10), 4, ['RTH'] * 10) is None
+
+
+def test_taker_buy_ratio_from_frame():
+    bars, _, _ = scenario((101, 102.1, 103.2))
+    closed = bars[bars.close_time < bars.close_time.iloc[-1]]
+    assert taker_buy_ratio(closed, 4) == pytest.approx(0.5)
+    assert taker_buy_ratio(closed.drop(columns=['taker_buy_volume']), 4) is None
 
 
 def test_small_pullback_allowed():
